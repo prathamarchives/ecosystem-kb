@@ -1,0 +1,56 @@
+# Ecosystem KB — production stack (spec §40). Only the gateway is public.
+services:
+  kb-api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      KB_DATABASE_URL: ${KB_DATABASE_URL}
+      KB_GRAPH_HOST: falkordb
+      KB_GRAPH_PORT: 6379
+      KB_GRAPH_PASSWORD: ${FALKORDB_PASSWORD}
+      KB_GRAPH_DATABASE: ${KB_NAMESPACE:-ecosystem_prod}
+      KB_API_TOKENS: ${KB_API_TOKENS}
+      KB_LLM_PROVIDER: ${KB_LLM_PROVIDER:-openai}
+      KB_LLM_MODEL: ${KB_LLM_MODEL}
+      KB_LLM_API_KEY: ${KB_LLM_API_KEY}
+    depends_on: [falkordb]
+    restart: unless-stopped
+    command: uvicorn ecosystem_kb.api.app:create_app --factory --host 0.0.0.0 --port 8000
+
+  kb-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      KB_DATABASE_URL: ${KB_DATABASE_URL}
+      KB_GRAPH_HOST: falkordb
+      KB_GRAPH_PORT: 6379
+      KB_GRAPH_PASSWORD: ${FALKORDB_PASSWORD}
+      KB_LLM_PROVIDER: ${KB_LLM_PROVIDER:-openai}
+      KB_LLM_MODEL: ${KB_LLM_MODEL}
+      KB_LLM_API_KEY: ${KB_LLM_API_KEY}
+    depends_on: [falkordb]
+    restart: unless-stopped
+    command: kb worker
+
+  falkordb:
+    image: falkordb/falkordb:latest
+    environment:
+      FALKORDB_PASSWORD: ${FALKORDB_PASSWORD}
+    volumes:
+      - falkordb_data:/data
+    restart: unless-stopped
+    # Private: no ports published. Gateway reaches it on the compose network.
+
+  proxy:
+    image: caddy:2-alpine
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    restart: unless-stopped
+
+volumes:
+  falkordb_data:
+  caddy_data:

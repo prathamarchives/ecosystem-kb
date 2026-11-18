@@ -1,0 +1,16 @@
+# Reverse proxy: TLS terminates here; only the gateway is exposed.
+{$KB_DOMAIN} {
+	handle /mcp* {
+		reverse_proxy kb-api:8000
+	}
+	handle /v1* {
+		reverse_proxy kb-api:8000
+	}
+	handle /health {
+		reverse_proxy kb-api:8000
+	}
+	handle /ready {
+		reverse_proxy kb-api:8000
+	}
+	respond 404
+}
