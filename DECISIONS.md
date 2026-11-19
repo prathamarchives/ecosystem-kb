@@ -146,3 +146,34 @@ executes the review's Gate 5 acceptance: HTTPS submit, idempotency,
 authz enforcement, second-client provenance retrieval, and a REAL
 backup+restore of both stores with consistency checks. **Result:** 27/27
 checks pass. The drill doubles as the VM deployment procedure.
+
+
+## ADR-017 · Local host + named Cloudflare Tunnel is a replaceable transport, not an architecture
+**Status:** Accepted (2026-11-19). **Decision:** the plug-and-play milestone
+deploys the stack on the owner's machine via a dedicated local Compose profile
+(`deploy/compose.local.yaml`) with a remotely managed named Cloudflare Tunnel
+routing `https://kb.<domain>` to `http://api:8000` over the private Compose
+network. The application interface (MCP tools, REST contracts, kb.event.v1)
+carries zero hosting knowledge: no code path may depend on Cloudflare, on the
+tunnel, or on the local topology. A later VM migration moves volumes/backups
+and re-points the tunnel connector only — client configurations and tool
+semantics stay unchanged. **Rationale:** plan §1/§17; the stable interface is
+the product and hosting is replaceable. **Consequences:** Caddy TLS remains
+only in the self-hosted-VM profile (never stacked inside the local tunnel
+route); no Quick Tunnel as the daily endpoint (ephemeral URL, no SSE); no
+mandatory Cloudflare Access layer in v1 (unattended MCP clients must connect
+without interactive login).
+
+## ADR-018 · Protocol-verified MCP mount: chained lifespan, mirrored state, pre-protocol auth
+**Status:** Accepted (2026-11-19). **Decision:** the FastAPI app builds the
+FastMCP `http_app()` sub-app in `create_app()`, chains its Starlette lifespan
+inside the app lifespan (session-manager init), mirrors services/auth onto
+the sub-app's own `State` (the sub-app replaces `scope["app"]`, so the
+FastAPI parent is unreachable from inside tools), and wraps the mount in
+`McpAuthMiddleware` that validates the bearer token BEFORE any protocol
+handling (missing/invalid/revoked → 401 at initialize). **Rationale:** the
+plug-and-play plan's AT-03 exposed that `/mcp` had never been reachable over
+HTTP: the mount's lifespan never ran and tools could not resolve services.
+Protocol-level tests (real uvicorn + Streamable HTTP) now gate this. Auth
+runs pre-protocol because initialize itself carries no tool call where the
+service layer could reject a forged token (plan §F-1).

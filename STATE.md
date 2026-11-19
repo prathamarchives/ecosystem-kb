@@ -1,138 +1,70 @@
 # STATE.md — current implementation state
 
-Last updated: 2026-11-19 (repair/resilience branch, post-review b7cbe39)
+Last updated: 2026-11-19 (feat/plug-and-play-local-tunnel, post main@5f4d499)
 
-## Status: failure-resilience repair complete; all review gates closed in-sandbox
+## Status: plug-and-play milestone implemented on the branch; push/CI/merge pending
 
-This branch answers the 2026-11-19 review of b7cbe39. Every P0/P1/P2 finding
-has a code fix plus a test that would fail without it. 113 tests pass / 2
-skipped locally; ruff is clean; the full deployment drill passes 27/27.
+This branch implements the 2026-11-19 plug-and-play execution plan against
+verified main@5f4d499 (CI run 44461844352 green; baseline 113 tests / 2
+skipped re-verified in-sandbox before any change).
 
-### Gate 0 — CI and lint
-- All 53 (then 81 with new code) ruff findings fixed properly: StrEnum
-  conversions inspected (all pure str-enums), the F821 undefined-name bug
-  removed with its dead route branch, B008 scoped to FastAPI's Depends
-  idiom via per-file-ignores, B017 tests use specific exception types.
-- CI is four separate jobs (lint, unit, embedded-integration,
-  postgres-integration) — no test step is skipped because a quality gate
-  failed. NOTE: GitHub Actions has not yet OBSERVED these jobs running;
-  the workflow is committed but the push requires restored credentials.
+## Critical fix discovered by this work
+`/mcp` was NEVER reachable over HTTP on main (ADR-018): the FastMCP
+sub-app's lifespan (session-manager init) never ran because FastAPI's
+custom lifespan replaced it; tools could not resolve services (the mounted
+sub-app replaces scope["app"]); and protocol initialize succeeded with ANY
+or NO token. Existing tests called tool functions directly, and the drill
+only exercised REST, so this was invisible. Fixed via chained lifespan +
+mirrored sub-app state + McpAuthMiddleware (pre-protocol bearer
+validation: missing/invalid/revoked → 401 at initialize). Protocol-level
+tests over real uvicorn + Streamable HTTP now gate this.
 
-### Gate 1 — production control plane
-- `asyncpg` is a runtime dependency (was dev-only — the P0 image defect);
-  the Dockerfile also copies migrations/ and self-checks imports at build.
-- Versioned migration runner (`adapters/postgres/migrations.py`): ordered,
-  recorded in `kb_schema_migrations`, dialect-aware, idempotent; verified
-  against BOTH SQLite and a real PostgreSQL (pgserver) in
-  tests/integration/test_postgres.py (incl. ORM/migration parity check).
-  Startup runs `migrate()`, not `create_all()`.
-- Atomic submit: ledger row + full serialized envelope (`event_payload`) +
-  queue job commit in ONE transaction (fault-injection test proves the
-  worker can never see a payload-less row).
-- `payload_reference` (content URI) and `event_payload` (envelope) are
-  separate columns.
-- Fingerprint idempotency: same key + same payload = duplicate receipt;
-  same key + different payload = 409 ConflictError (tested over HTTPS).
-- Source-ownership authorization: clients carry `allowed_sources`; unknown
-  sources quarantine under an onboarding review, never accepted as
-  authoritative provenance (tested, including a rival-client rejection).
-- Production guard: `KB_ENVIRONMENT=production` refuses weak/static tokens
-  at startup and disables the dev-token auth fallback (drill runs in this
-  mode; the drill's API has NO static tokens).
+## What the branch delivers (plan § map)
+- WP-A: docs/GAP-REPORT.md, docs/PLUG-AND-PLAY-ACCEPTANCE.md, ADR-017.
+- WP-B: deploy/compose.local.yaml (pg 16.9-alpine, falkordb 4.22.1 pinned;
+  private network, no DB ports; healthchecks; one-shot migrate service;
+  restart policies; cloudflared behind `tunnel` profile), .env.example
+  regroup, full kb CLI (setup/up/down/restart/logs/status/doctor/nuke/
+  client create-list-revoke-rotate/connect/disconnect/tunnel/backup/
+  restore), EventRepository.queue_stats, client lifecycle in repos
+  (audited). Backup: real pg_dump + FalkorDB SAVE + manifest + checksums +
+  verify-then-atomic-publish; restore checksum-gated with live-volume
+  confirmation. Drill re-run: 27/27 (backup+restore into fresh instances).
+- WP-C: cloudflared 2025.11.1 service + docs/TUNNEL-SETUP.md (dashboard
+  steps, token handling, AT-02 verification, VM migration path).
+- WP-D: kb_context + kb_capture over the SAME service layer (per-client
+  source system:mcp:<client_id>, server-generated ids/idempotency, actor
+  from the authenticated credential, epistemic note); product-grade tool
+  descriptions; 9-tool surface; protocol tests.
+- WP-E: connect wizard + docs/clients/CONNECT.md + AGENT-INSTRUCTIONS.md.
+- WP-F: negatives — missing/invalid/revoked token 401 pre-protocol,
+  reader-cannot-capture, actor attribution from credential only, capture
+  goes through the secret-scan gate.
+- WP-G: 30-case labelled extraction eval + harness; LAW invariants
+  asserted, quality reported; docs/EVAL.md with real-provider runbook.
+- WP-H: kb status/doctor output per plan §12 (containers, MCP endpoint,
+  readiness, public URL, last backup, knowledge counts, queue depth).
 
-### Gate 2 — worker recovery
-- Atomic claims: Postgres `FOR UPDATE SKIP LOCKED` + `UPDATE..RETURNING`
-  (concurrent-claim test with 4 workers / 8 jobs on real PG: exactly-once);
-  SQLite path uses a single transaction.
-- FIFO by `created_at, next_attempt_at` (not UUID).
-- Lease recovery: expired `processing` leases are re-queued on claim
-  (dead-worker test: recovery + ownership loss for the dead worker).
-- Heartbeat extends leases during processing; complete/fail are
-  ownership-guarded (stale worker gets `False` / `lost_ownership`).
-- Bounded exponential backoff (`base * 2^(n-1)`, tested); exhausted or
-  non-retryable failures go to a distinct `dead_letter` state with the
-  error recorded.
-- Retry classification corrected: transient infra errors retry, validation
-  errors dead-letter (was inverted).
-- Crash-after-graph-write converges: reconciliation by episode identity,
-  race-tolerant lifecycle transitions (two-worker race test).
+## Test state (in-sandbox, final run on branch)
+unit 60, contract 15 (incl. 11 protocol-over-HTTP), security 12,
+integration 32 + eval 3 → 122 passed / 2 skipped; ruff clean.
 
-### Gate 3 — ontology before canonical writes
-- Ingestion uses `add_episode_bulk(strict_edge_types=True)`: graphiti DROPS
-  extracted edges that don't use canonical edge types before commit.
-- Post-write verification re-validates every returned edge by relation name
-  + endpoint labels; non-canonical edges (including RELATES_TO fallbacks)
-  are quarantined with review-queue evidence and compensated (deleted
-  best-effort).
-- `RELATES_TO` removed from the canonical retrieval vocabulary (search and
-  entity context filter by registry names only).
-- Verified storage model (upstream): graphiti's FalkorDB driver writes all
-  entity edges with physical type RELATES_TO and carries the canonical
-  relation in the `name` property; all reads filter on `e.name`. Raw-Cypher
-  consumers must use `e.name` (documented here + in the drill).
-- Tests: unknown predicate (`HATES`) is quarantined and NOT retrievable;
-  the tautological `>= 0` assertion is gone.
-
-### Gate 4 — retrievable provenance + durable maintenance
-- `kb_provenance_links` maps event ↔ episode ↔ source ↔ entity/edge with
-  revision, content hash, timestamps, ontology version.
-- Search and entity-context responses carry provenance summaries and source
-  references via a wired resolver (not the never-called optional param).
-  `GET /v1/sources/{event_id|edge_uuid|entity_uuid}` reconstructs the chain.
-- Maintenance proposals live in `kb_maintenance_actions`: stable action ids
-  (operation+targets), `proposal_version` hashes binding approvals to the
-  exact proposal, guarded state machine (pending→approved/rejected→
-  running→completed/failed), apply-attempts counter.
-- Apply is restart-safe and idempotent: already-completed is a no-op; every
-  merge step is a compare-and-set; a crashed 'running' resumes cleanly
-  (fresh-service-instance test simulates restart).
-- ADR-013: ENTITY_MERGE is explicitly a control-plane identity/alias merge
-  (renamed accurately), not a graph merge.
-- Duplicate detection requires same canonical name AND same entity type;
-  cross-type name collisions (System "Mercury" vs Claim "Mercury") never
-  propose merges (tested).
-
-### Gate 5 — deployment and recovery drill (scripts/deploy_drill.py, 27/27)
-- Boots the production stack locally: real PostgreSQL (pgserver) + persistent
-  FalkorDB + Caddy TLS (internal CA, unprivileged ports) + uvicorn API +
-  worker subprocess, all in production mode.
-- Acceptance over HTTPS: authed submit, idempotent duplicate, 401/403
-  enforcement, worker processing, SECOND-client retrieval WITH provenance,
-  provenance trace by event id.
-- REAL backup + restore: pg_dump + checksums, FalkorDB SAVE + RDB copy,
-  manifest; restore into FRESH Postgres + FRESH FalkorDB; consistency
-  checks (ledger, provenance links, completed status, graph facts,
-  canonical relation preserved).
-- The backup script itself (scripts/backup.py) fails loudly and writes a
-  manifest; the drill is the executable restore-verification procedure.
-
-### Gate 6 — Arivoo as first producer
-- `integrations/arivoo_relay.py`: transactional-outbox row model, the
-  outbox→kb.event.v1 mapping contract (idempotency key = record+revision,
-  supersession payload), and a crash-safe relay (marks sent only after the
-  KB confirms; replays deduplicate).
-- Acceptance tests (5/5): mapping contract, revision supersession without
-  losing history, relay crash→replay exactly-once (exactly one ledger row),
-  second-client retrieval with provenance and full chain trace.
-
-## Remaining honestly-not-done
-1. **Push + observed CI.** The sandbox was recycled; GitHub credentials are
-   gone. The repair branch is committed locally on top of b7cbe39 and ready
-   to push when the PAT is restored; the CI workflow has never been watched
-   running on GitHub.
-2. **Repo visibility.** GitHub reports the repo as public (per the review).
-   Decide intentionally; if unintended, switch back to private.
-3. **Real VM deployment.** The drill proves the stack works as deployed
-   (production mode, TLS, backup/restore) but on sandbox-local processes.
-   DNS + a persistent host + scheduled backups remain operational work.
-4. **Real-LLM extraction quality** still unmeasured (fake pipeline is real,
-   judgment is not).
-5. **Ops surface**: queue depth / oldest job / dead-letter metrics are in
-   the DB (statuses, next_attempt_at) but not exported as dashboards yet.
+## Honestly not done / limits
+1. Push + observed CI + merge — next action (this file documents the
+   pre-push state).
+2. Container-level acceptance (AT-01/02/06/07 literal Docker form) needs
+   the owner's host: no Docker daemon in the agent sandbox. The compose
+   file, drill, and kb doctor cover the equivalent logic in-sandbox.
+3. Named-tunnel live test (AT-02) requires the owner's Cloudflare domain +
+   token in local .env. Docs/TUNNEL-SETUP.md has the exact steps.
+4. Real-LLM extraction quality unmeasured (fake provider proves plumbing;
+   runbook in docs/EVAL.md).
+5. Sandbox was hard-recycled before this session: repos/, tools/, memory/,
+   .secrets/ were rebuilt from GitHub + conversation-held PAT.
 
 ## Next actions
-1. Restore GitHub credentials; push repair/resilience; watch CI go green.
-2. Decide repo visibility.
-3. Deploy to the persistent VM using deploy/ + run scripts/deploy_drill.py
-   against it unchanged.
-4. Wire real Arivoo to the relay contract.
+1. Push feat/plug-and-play-local-tunnel; watch CI; merge after green.
+2. Owner: machine with Docker → kb setup / kb up / kb doctor (AT-01).
+3. Owner: Cloudflare tunnel per docs/TUNNEL-SETUP.md → kb tunnel status.
+4. Owner: connect clients per docs/clients/CONNECT.md (AT-03..05, 09).
+5. Real-provider eval baseline recorded in docs/EVAL.md.

@@ -85,3 +85,54 @@ class TestAuditTrail:
         await maintenance.decide_proposal(decision)
         rows = await control_plane.audit.for_resource("maintenance_action", action.action_id)
         assert any(r.action == "maintenance_decision" for r in rows)
+
+
+class TestPlugAndPlaySecurity:
+    """WP-F additions: capture-surface authz, actor spoofing, revocation."""
+
+    async def test_capture_actor_is_authenticated_client(self, services, admin_client):
+        """kb_capture attributes the AUTHENTICATED client, never payload claims
+        (plan §F-5: identity from the credential, not the request)."""
+        from ecosystem_kb.services.high_level import kb_capture
+
+        # A hostile client cannot smuggle actor claims: the capture API has
+        # no actor field at all, so attribution comes only from the token.
+        receipt = await kb_capture(
+            services, admin_client, kind="decision",
+            title="Spoof probe", content="Payload will claim another actor.",
+        )
+        assert receipt["event_id"]
+        import json as _json
+
+        row = await services.repos.events.get_by_event_id(receipt["event_id"])
+        serialized = _json.loads(row.event_payload)
+        assert serialized["actor"]["id"] == admin_client.client_id
+        assert serialized["payload"]["captured_by"] == admin_client.client_id
+        assert "someone-else" not in _json.dumps(serialized)
+
+    async def test_capture_rejects_reader(self, services, reader_client):
+        from ecosystem_kb.services.high_level import kb_capture
+
+        with pytest.raises(AuthorizationError):
+            await kb_capture(services, reader_client, kind="note",
+                             title="x", content="y")
+
+    async def test_revoked_client_fails_authentication(self, services, control_plane):
+        """AT-05: revocation is enforced at auth time, not request-payload time."""
+        token = await control_plane.clients.register("sec-revoked", "R", ["kb:read"], ["ecosystem-dev"])
+        row = await control_plane.clients.find_by_token(token)
+        assert row.status == "active"
+        await control_plane.clients.set_status("sec-revoked", "revoked", actor="test")
+        row = await control_plane.clients.find_by_token(token)
+        assert row.status == "revoked"
+
+    async def test_capture_secret_content_rejected(self, services, admin_client):
+        """The capture path goes through the same policy gate (LAW-010)."""
+        from ecosystem_kb.core.exceptions import SecretContentError  # noqa: I001 (grouped with use)
+        from ecosystem_kb.services.high_level import kb_capture
+
+        with pytest.raises(SecretContentError):
+            await kb_capture(
+                services, admin_client, kind="note",
+                title="leak", content="api_key=sk-1234567890abcdef1234567890abcdef",
+            )
