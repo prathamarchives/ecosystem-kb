@@ -272,8 +272,9 @@ async def _cmd_status(args) -> None:
             line(f"  {k}", str(v))
     else:
         line("Readiness", f"api not reachable on {_api_base()}")
-    if env.get("KB_PUBLIC_URL"):
-        line("Public URL", env["KB_PUBLIC_URL"] + "/mcp")
+    if env.get("KB_PUBLIC_BASE_URL") or env.get("KB_PUBLIC_URL"):
+        public = env.get("KB_PUBLIC_BASE_URL") or env.get("KB_PUBLIC_URL")
+        line("Public URL", public.rstrip("/") + "/mcp")
     line("Last backup", _last_backup() or "none yet — run `kb backup`")
     # Knowledge + queue snapshot through the admin API (no direct DB access).
     try:
@@ -381,7 +382,7 @@ async def _mcp_probe() -> bool:
         import httpx
 
         r = await httpx.AsyncClient(timeout=10).post(
-            f"{_api_base()}/mcp/",
+            f"{_api_base()}/mcp",
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
@@ -504,11 +505,12 @@ def _merge_mcp_json(path: Path, fragment: dict) -> dict:
 async def _cmd_connect(args) -> None:
     env = _load_env()
     name = args.name or _default_client_name(args.target)
-    public = env.get("KB_PUBLIC_URL")
-    # FastMCP's Streamable HTTP route needs the trailing slash; without it a
-    # TLS-terminating proxy (Cloudflare) turns the redirect into an http://
-    # downgrade that clients refuse.
-    endpoint = f"{public.rstrip('/')}/mcp/" if public else f"{_api_base()}/mcp/"
+    # Canonical endpoint is /mcp with NO trailing slash (runbook §1.2.5):
+    # the app now serves /mcp directly (no redirect to /mcp/), so the old
+    # slash workaround is gone. KB_PUBLIC_URL is the one-release alias for
+    # KB_PUBLIC_BASE_URL.
+    public = env.get("KB_PUBLIC_BASE_URL") or env.get("KB_PUBLIC_URL")
+    endpoint = f"{public.rstrip('/')}/mcp" if public else f"{_api_base()}/mcp"
 
     existing = None
     try:
@@ -614,7 +616,10 @@ def _cmd_tunnel(args) -> None:
             return
         states = _container_states()
         print(f"tunnel: token configured; cloudflared container: {states.get('cloudflared', 'not running')}")
-        print(f"public URL: {env.get('KB_PUBLIC_URL', '(KB_PUBLIC_URL not set in .env)')}/mcp")
+        public = (
+            env.get("KB_PUBLIC_BASE_URL") or env.get("KB_PUBLIC_URL") or "(KB_PUBLIC_BASE_URL not set in .env)"
+        )
+        print(f"public URL: {public.rstrip('/')}/mcp")
         _compose("logs", "--tail", "20", "cloudflared")
 
 

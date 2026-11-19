@@ -1,4 +1,19 @@
-"""Bearer-token authentication + scope/namespace authorization middleware."""
+"""Bearer-token authentication + scope/namespace authorization (Step 8).
+
+One principal resolver, no per-tool token parsing:
+
+  - MCP (/mcp): KB OAuth access tokens ONLY. Cookies, Supabase login JWTs
+    and unregistered static tokens are refused (runbook Step 8).
+  - REST (/v1/*): KB OAuth bearer tokens; the dashboard API additionally
+    authenticates the owner through the kb_session cookie (its routes do
+    that themselves before reaching the services).
+  - Legacy static client tokens (kb_clients table) are accepted only while
+    KB_ALLOW_LEGACY_CLIENT_TOKENS=true (default false). Rows are preserved
+    for rollback; the flag is the one-release migration bridge.
+
+The bearer token is looked up by SHA-256 hash; the plaintext never
+touches the database (LAW-009, LAW-010).
+"""
 
 from __future__ import annotations
 
@@ -14,46 +29,31 @@ _bearer = HTTPBearer(auto_error=False)
 
 
 class AuthService:
-    """Token → control-plane client record → AuthenticatedClient.
+    """Token → principal (OAuth client or legacy static client).
 
-    The bearer token is looked up by SHA-256 hash; the plaintext never
-    touches the database (LAW-009, LAW-010).
+    `oauth` (the AuthorizationServer) is wired in by create_app's lifespan;
+    tests can inject a stub. When absent, only legacy/static paths resolve.
     """
 
     def __init__(self, repos: Repositories, settings: KbSettings) -> None:
         self.repos = repos
         self.settings = settings
-        self._supabase = None
-        if settings.supabase_url:
-            from ecosystem_kb.api.supabase_auth import SupabaseJWTVerifier
+        self.oauth = None  # wired post-construction (AuthorizationServer)
 
-            self._supabase = SupabaseJWTVerifier(
-                settings.supabase_url, settings.supabase_anon_key
-            )
-
-    async def _supabase_client(self, token: str) -> AuthenticatedClient | None:
-        """Verify a Supabase-issued JWT and map its claims to a KB client."""
-        if self._supabase is None:
-            return None
-        try:
-            claims = await self._supabase.verify(token)
-        except Exception:
-            return None
-        sub = claims.get("sub") or claims.get("user_id")
-        if not sub:
-            return None
-        meta = claims.get("app_metadata") or {}
-        scopes = meta.get("kb_scopes") or ["kb:read", "kb:write"]
-        namespaces = meta.get("kb_namespaces") or self.settings.namespace_list
-        if isinstance(namespaces, str):
-            namespaces = [namespaces]
+    def _client_from_oauth_token(self, token_row) -> AuthenticatedClient:
+        """Map a validated KB OAuth access-token row to an AuthenticatedClient.
+        OAuth clients get the deployment's namespaces and their consented
+        knowledge scopes — never admin/maintain scopes (runbook §6)."""
+        scopes = [s for s in (token_row.scopes or []) if s in ("kb:read", "kb:write")]
+        if not scopes:
+            raise AuthenticationError("token carries no usable scope")
         return AuthenticatedClient(
-            client_id=f"supabase:{sub}",
-            scopes=list(scopes),
-            allowed_namespaces=list(namespaces),
+            client_id=f"oauth:{token_row.client_id}",
+            scopes=scopes,
+            allowed_namespaces=self.settings.namespace_list,
             allowed_sources=["*"],
             default_namespace=self.settings.default_namespace
-            if self.settings.default_namespace in namespaces
+            if self.settings.default_namespace in self.settings.namespace_list
             else None,
         )
 
@@ -61,14 +61,46 @@ class AuthService:
         """Token -> client (used by the MCP mount, which reads the header itself)."""
         if not token:
             raise AuthenticationError("missing bearer token")
+        # 1. KB OAuth access token (the normal path). A token that is not a
+        #    valid OAuth token falls through to the static/legacy paths —
+        #    only a FORMERLY-valid-but-now-revoked OAuth token raises here.
+        if self.oauth is not None:
+            try:
+                token_row = await self.oauth.validate_access_token(token)
+                return self._client_from_oauth_token(token_row)
+            except AuthenticationError:
+                found = await self.oauth.tokens.find(token, "access")
+                if found is not None:
+                    # It IS one of our OAuth tokens, just invalid/expired/
+                    # revoked: do not fall through to weaker paths.
+                    raise
+        # 2. Legacy static client token. The pre-registered host-CLI admin
+        #    client (kb-admin, seeded by `kb bootstrap --seed-admin`) remains a
+        #    valid loopback credential per the runbook. Other static client
+        #    tokens work in development while KB_ALLOW_STATIC_TOKENS=true,
+        #    or during the migration window with KB_ALLOW_LEGACY_CLIENT_TOKENS.
         row = await self.repos.clients.find_by_token(token)
-        if row is None:
-            oauth_client = await self._supabase_client(token)
-            if oauth_client is not None:
-                return oauth_client
-            # Static fallback tokens are a DEVELOPMENT convenience only.
-            if self.settings.is_production:
-                raise AuthenticationError("invalid token")
+        if row is not None:
+            is_admin_row = row.client_id == "kb-admin"
+            static_ok = (
+                (not self.settings.is_production and self.settings.allow_static_tokens)
+                or self.settings.allow_legacy_client_tokens
+            )
+            if not is_admin_row and not static_ok:
+                raise AuthenticationError(
+                    "legacy static client tokens are disabled; connect via OAuth"
+                )
+            if row.status != "active":
+                raise AuthenticationError(f"client '{row.client_id}' is {row.status}")
+            return AuthenticatedClient(
+                client_id=row.client_id,
+                scopes=list(row.scopes or []),
+                allowed_namespaces=list(row.allowed_namespaces or []),
+                allowed_sources=list(getattr(row, "allowed_sources", None) or ["*"]),
+            )
+        # 3. Dev-mode fallback: tokens from settings act as admin clients.
+        #    Production forbids this (validate_runtime_safety + default-off flag).
+        if not self.settings.is_production and self.settings.allow_static_tokens:
             if token in self.settings.token_list:
                 return AuthenticatedClient(
                     client_id="local-dev",
@@ -78,42 +110,16 @@ class AuthService:
                     if self.settings.default_namespace in self.settings.namespace_list
                     else None,
                 )
-            raise AuthenticationError("invalid token")
-        if row.status != "active":
-            raise AuthenticationError(f"client '{row.client_id}' is {row.status}")
-        return AuthenticatedClient(
-            client_id=row.client_id,
-            scopes=list(row.scopes or []),
-            allowed_namespaces=list(row.allowed_namespaces or []),
-            allowed_sources=list(getattr(row, "allowed_sources", None) or ["*"]),
-        )
+        raise AuthenticationError("invalid token")
 
     async def authenticate(
         self,
+        request: Request,
         credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
     ) -> AuthenticatedClient:
         if credentials is None or not credentials.credentials:
             raise AuthenticationError("missing bearer token")
-        row = await self.repos.clients.find_by_token(credentials.credentials)
-        if row is None:
-            oauth_client = await self._supabase_client(credentials.credentials)
-            if oauth_client is not None:
-                return oauth_client
-            # Dev-mode fallback: tokens from settings act as admin clients.
-            if credentials.credentials in self.settings.token_list:
-                return AuthenticatedClient(
-                    client_id="local-dev",
-                    scopes=["kb:read", "kb:write", "kb:review", "kb:maintain", "kb:admin"],
-                    allowed_namespaces=self.settings.namespace_list,
-                )
-            raise AuthenticationError("invalid token")
-        if row.status != "active":
-            raise AuthenticationError(f"client '{row.client_id}' is {row.status}")
-        return AuthenticatedClient(
-            client_id=row.client_id,
-            scopes=list(row.scopes or []),
-            allowed_namespaces=list(row.allowed_namespaces or []),
-        )
+        return await self.authenticate_token(credentials.credentials)
 
 
 def client_from_request(request: Request) -> AuthenticatedClient:

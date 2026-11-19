@@ -38,8 +38,20 @@ kb setup                              # creates .env (0600) with generated secre
 # add KB_LLM_API_KEY etc. to .env for full ingestion (read-only without)
 kb up                                 # postgres + falkordb + api + worker (+ tunnel if CF_TUNNEL_TOKEN)
 kb doctor                             # deep diagnostics (clean local-only install exits 0; --strict for provisioned checks)
-kb connect claude-code                # client credential + connection snippet
 ```
+
+Connecting an MCP client is just a URL — no API keys. The client opens the
+browser, the owner signs in once (Supabase magic link) and approves the
+client; OAuth 2.1 (PKCE, first-party authorization server) handles the
+rest:
+
+```json
+{ "mcpServers": { "ecosystem-kb": { "url": "https://kb.<your-domain>/mcp" } } }
+```
+
+See [docs/clients/CONNECT.md](docs/clients/CONNECT.md). The owner
+dashboard (search, capture, client management, status) is served at
+`https://kb.<your-domain>/`.
 
 Remote access goes through a named Cloudflare Tunnel:
 `https://kb.<your-domain>/mcp` — see [docs/TUNNEL-SETUP.md](docs/TUNNEL-SETUP.md).

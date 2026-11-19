@@ -24,6 +24,7 @@ async def mcp_app(embedded_graph, tmp_path):
         default_namespace="ecosystem-dev",
         allowed_namespaces="ecosystem-dev,ecosystem-test,ecosystem-prod,mcp-unique-ns",
         api_tokens="mcp-test-token",
+        allow_static_tokens=True,
     )
     cp = ControlPlane(settings.database_url)
     await cp.create_all()
