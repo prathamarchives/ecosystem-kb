@@ -29,13 +29,29 @@ Read first: [INTENT-LEDGER.md](INTENT-LEDGER.md) (why),
 - Runs a **bounded Maintainer** that audits graph health and proposes
   changes under an approval gate.
 
-## Quickstart (local, embedded graph)
+## Quickstart (plug-and-play local stack)
+
+```bash
+git clone https://github.com/prathamarchives/ecosystem-kb && cd ecosystem-kb
+pip install -e .                      # or uv pip install -e .
+kb setup                              # creates .env (0600) with generated secrets
+# add KB_LLM_API_KEY etc. to .env for full ingestion (read-only without)
+kb up                                 # postgres + falkordb + api + worker (+ tunnel if CF_TUNNEL_TOKEN)
+kb doctor                             # deep diagnostics
+kb connect claude-code                # client credential + connection snippet
+```
+
+Remote access goes through a named Cloudflare Tunnel:
+`https://kb.<your-domain>/mcp` — see [docs/TUNNEL-SETUP.md](docs/TUNNEL-SETUP.md).
+Connecting clients: [docs/clients/CONNECT.md](docs/clients/CONNECT.md).
+Day-to-day: `kb status`, `kb backup` / `kb restore`, `kb client list`.
+Acceptance criteria: [docs/PLUG-AND-PLAY-ACCEPTANCE.md](docs/PLUG-AND-PLAY-ACCEPTANCE.md).
+
+## Quickstart (developer, embedded graph)
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,embedded]"
-cp .env.example .env                       # defaults are local-dev safe
-docker compose -f deploy/compose.yaml up -d falkordb   # or skip: tests use embedded
 pytest                                     # unit + embedded integration
 uvicorn ecosystem_kb.api.app:create_app --factory --reload   # REST + MCP at :8000
 ```
