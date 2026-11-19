@@ -37,7 +37,7 @@ pip install -e .                      # or uv pip install -e .
 kb setup                              # creates .env (0600) with generated secrets
 # add KB_LLM_API_KEY etc. to .env for full ingestion (read-only without)
 kb up                                 # postgres + falkordb + api + worker (+ tunnel if CF_TUNNEL_TOKEN)
-kb doctor                             # deep diagnostics
+kb doctor                             # deep diagnostics (clean local-only install exits 0; --strict for provisioned checks)
 kb connect claude-code                # client credential + connection snippet
 ```
 
@@ -45,6 +45,8 @@ Remote access goes through a named Cloudflare Tunnel:
 `https://kb.<your-domain>/mcp` — see [docs/TUNNEL-SETUP.md](docs/TUNNEL-SETUP.md).
 Connecting clients: [docs/clients/CONNECT.md](docs/clients/CONNECT.md).
 Day-to-day: `kb status`, `kb backup` / `kb restore`, `kb client list`.
+Host CLI architecture and security boundary (ADR-019): [docs/HOST-CLI-ARCHITECTURE.md](docs/HOST-CLI-ARCHITECTURE.md).
+Owner-host acceptance checks (Docker-level): `bash scripts/host_acceptance.sh`.
 Acceptance criteria: [docs/PLUG-AND-PLAY-ACCEPTANCE.md](docs/PLUG-AND-PLAY-ACCEPTANCE.md).
 
 ## Quickstart (developer, embedded graph)
