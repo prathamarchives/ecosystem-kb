@@ -203,6 +203,24 @@ class EventRepository:
 
     # -- job queue (Gate 2) ----------------------------------------------------
 
+    async def queue_stats(self) -> dict[str, int]:
+        """Queue observability (plug-and-play plan §H): depth per status plus
+        the age of the oldest queued job."""
+        async with self.cp.session() as s:
+            rows = await s.execute(
+                select(KbIngestionJob.status, func.count()).group_by(KbIngestionJob.status)
+            )
+            stats = {status: count for status, count in rows.all()}
+            stats.setdefault("queued", 0)
+            oldest = await s.scalar(
+                select(func.min(KbIngestionJob.created_at)).where(KbIngestionJob.status == "queued")
+            )
+            if oldest is not None:
+                stats["oldest_queued_age_seconds"] = int(
+                    (datetime.now(UTC) - oldest).total_seconds()
+                )
+            return stats
+
     async def claim_next_job(
         self, worker_id: str, lease_seconds: int = 300
     ) -> KbIngestionJob | None:
@@ -558,6 +576,52 @@ class ClientRepository:
             return await s.scalar(
                 select(KbClient).where(KbClient.token_hash == hash_token(token))
             )
+
+    async def list_clients(self) -> list[KbClient]:
+        """All registered clients (plug-and-play: kb client list)."""
+        async with self.cp.session() as s:
+            res = await s.scalars(select(KbClient).order_by(KbClient.created_at))
+            return list(res)
+
+    async def set_status(self, client_id: str, status: str, *, actor: str) -> KbClient | None:
+        """Revoke ('revoked') or reactivate ('active') a client. Audited (LAW-014)."""
+        row, before = None, None
+        async with self.cp.session() as s:
+            row = await s.scalar(select(KbClient).where(KbClient.client_id == client_id))
+            if row is None:
+                return None
+            before = row.status
+            row.status = status
+            await s.commit()
+            await s.refresh(row)
+        await AuditRepository(self.cp).record(
+            actor=actor,
+            action=f"client.{status}",
+            resource_type="client",
+            resource_id=client_id,
+            reason=f"status {before} -> {status}",
+        )
+        return row
+
+    async def rotate_token(self, client_id: str, *, actor: str) -> str | None:
+        """Issue a fresh token for a client; old token stops working immediately.
+        Returns the plaintext ONCE, or None when the client does not exist."""
+        token = secrets.token_urlsafe(32)
+        async with self.cp.session() as s:
+            row = await s.scalar(select(KbClient).where(KbClient.client_id == client_id))
+            if row is None:
+                return None
+            row.token_hash = hash_token(token)
+            row.rotated_at = datetime.now(UTC)
+            await s.commit()
+        await AuditRepository(self.cp).record(
+            actor=actor,
+            action="client.token_rotated",
+            resource_type="client",
+            resource_id=client_id,
+            reason="token rotation",
+        )
+        return token
 
 
 class ReviewRepository:

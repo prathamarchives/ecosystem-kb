@@ -1,0 +1,124 @@
+# Ecosystem KB — LOCAL plug-and-play profile (ADR-017).
+#
+# One managed stack on the owner's machine: PostgreSQL + FalkorDB + API +
+# worker (+ optional cloudflared named tunnel). Databases are PRIVATE (no
+# published ports); the only ingress is the named Cloudflare Tunnel hitting
+# http://api:8000 over this network. The VM profile with its own TLS edge
+# stays in deploy/compose.yaml — the two never stack.
+#
+# Usage (from repo root, after `kb setup`):
+#   docker compose -f deploy/compose.local.yaml --profile tunnel up -d
+# Omit --profile tunnel until CF_TUNNEL_TOKEN exists in .env.
+
+name: ecosystem-kb
+
+x-kb-app: &kb-app
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  env_file: ../.env
+  environment:
+    KB_DATABASE_URL: postgresql+asyncpg://kb:${POSTGRES_PASSWORD}@postgres:5432/ecosystem_kb
+    KB_GRAPH_HOST: falkordb
+    KB_GRAPH_PORT: 6379
+    KB_GRAPH_PASSWORD: ${FALKORDB_PASSWORD}
+    KB_GRAPH_DATABASE: ${KB_NAMESPACE:-ecosystem_prod}
+    KB_DEFAULT_NAMESPACE: ${KB_NAMESPACE:-ecosystem_prod}
+    KB_ALLOWED_NAMESPACES: ${KB_NAMESPACE:-ecosystem_prod}
+    KB_ENVIRONMENT: production
+  restart: unless-stopped
+  networks: [kb-internal]
+
+services:
+  postgres:
+    image: postgres:16.9-alpine
+    environment:
+      POSTGRES_USER: kb
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ecosystem_kb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kb -d ecosystem_kb"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    networks: [kb-internal]
+    # Private: no ports published (plan §4.2).
+
+  falkordb:
+    image: falkordb/falkordb:4.22.1
+    environment:
+      FALKORDB_PASSWORD: ${FALKORDB_PASSWORD}
+    volumes:
+      - falkordb_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$FALKORDB_PASSWORD --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    networks: [kb-internal]
+    # Private: no ports published (plan §4.2).
+
+  migrate:
+    <<: *kb-app
+    command: kb bootstrap --migrate-only
+    depends_on:
+      postgres:
+        condition: service_healthy
+      falkordb:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *kb-app
+    command: uvicorn ecosystem_kb.api.app:create_app --factory --host 0.0.0.0 --port 8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      falkordb:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  worker:
+    <<: *kb-app
+    command: kb worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      falkordb:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Optional: expose the stack through a named Cloudflare Tunnel (WP-C).
+  # Activated only with --profile tunnel; token comes from .env, never git.
+  cloudflared:
+    image: cloudflare/cloudflared:2025.11.1
+    command: tunnel --no-autoupdate run --token ${CF_TUNNEL_TOKEN}
+    profiles: ["tunnel"]
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [kb-internal]
+    # Routes to http://api:8000 — configured in the Cloudflare dashboard
+    # (plan §C2). No published ports: the connection is outbound-only.
+
+volumes:
+  postgres_data:
+  falkordb_data:
+
+networks:
+  kb-internal:
+    driver: bridge
