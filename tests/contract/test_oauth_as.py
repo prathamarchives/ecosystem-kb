@@ -15,7 +15,6 @@ revocation, dashboard endpoints, and the canonical /mcp behaviour.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import hashlib
 import re
@@ -23,6 +22,7 @@ import secrets
 
 import httpx
 import pytest
+import pytest_asyncio
 
 from ecosystem_kb.api.app import create_app
 from ecosystem_kb.core.config import KbSettings
@@ -55,8 +55,8 @@ def pkce() -> tuple[str, str]:
     return verifier, challenge
 
 
-@pytest.fixture
-def app(tmp_path):
+@pytest_asyncio.fixture
+async def app(tmp_path):
     settings = KbSettings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/oauth_test.db",
         public_base_url=BASE,
@@ -66,23 +66,17 @@ def app(tmp_path):
     application = create_app(settings, graphiti=StubGraphiti())
     # ASGITransport does not run lifespans; wire app.state manually exactly
     # like create_app's lifespan does (see tests/fixtures/wire_app.py).
-
+    from ecosystem_kb.adapters.postgres.migrations import migrate
     from ecosystem_kb.adapters.postgres.repositories import ControlPlane
     from tests.fixtures.wire_app import wire_app_state
 
     cp = ControlPlane(settings.database_url)
-    asyncio.get_event_loop().run_until_complete(_migrate(cp.engine))
-    asyncio.get_event_loop().run_until_complete(
-        wire_app_state(application, settings=settings, graphiti=StubGraphiti(), control_plane=cp)
+    await migrate(cp.engine)
+    await wire_app_state(
+        application, settings=settings, graphiti=StubGraphiti(), control_plane=cp
     )
     application.state._test_cp = cp  # keep alive for the test duration
     return application
-
-
-async def _migrate(engine):
-    from ecosystem_kb.adapters.postgres.migrations import migrate
-
-    return await migrate(engine)
 
 
 @pytest.fixture
