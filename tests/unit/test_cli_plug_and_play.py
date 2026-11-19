@@ -49,7 +49,7 @@ class TestSetup:
         assert "KB_LLM_API_KEY is empty" in out  # read-only warning
         assert "Store it in a password manager" in out  # admin token shown once note
         # Admin token itself must be in the file but never printed.
-        admin = [l for l in text.splitlines() if l.startswith("KB_ADMIN_TOKEN=")][0]
+        admin = [ln for ln in text.splitlines() if ln.startswith("KB_ADMIN_TOKEN=")][0]
         assert admin.split("=", 1)[1] not in out
 
     def test_setup_never_overwrites_existing_env(self, repo_root, capsys):
