@@ -97,8 +97,6 @@ class TestClientLifecycle:
 
 class TestConnectSnippets:
     def test_generic_snippet_mentions_all_tools_and_endpoint(self, repo_root):
-        import ecosystem_kb.cli.main as cli
-
         # _cmd_connect prints the generic block; we assert on its content via
         # the module constants instead of spinning the control plane here.
         assert "kb_context" in CLIENT_SNIPPET and "kb_capture" in CLIENT_SNIPPET
