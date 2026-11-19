@@ -1,6 +1,36 @@
 # STATE.md — current implementation state
 
-Last updated: 2026-11-19 (feat/supermemory-style-mcp-oauth, on top of main@5356824)
+Last updated: 2026-11-20 (production cutover accepted on main@33072c2 + two follow-up fixes)
+
+## Production cutover — 2026-11-19/20
+
+Release `33072c2` is deployed on the local Docker host behind
+`https://kb.itscatalyst.com`. Migration 3 applied; PostgreSQL and FalkorDB
+volumes preserved; pre-cutover backup at
+`~/ecosystem-kb-backups/pre-oauth-cutover-20261119T165409Z` (pg_dump + RDB +
+manifest checksums verified).
+
+Real-client OAuth acceptance (OpenCode 2.2.7, DCR, PKCE S256):
+
+- `kb_search` over `/mcp` returned the existing FalkorDB dependency fact.
+- `kb_capture` created event `f145e496-00ce-45a1-a736-4582f6f510b1`
+  (note, namespace `ecosystem_prod`, processing status `completed`).
+- `kb_get_provenance` returned the same event after an API restart, proving
+  PostgreSQL persistence.
+- Owner consent `ad0fa277-f001-433f-883d-87e4dab606a3` granted to the DCR
+  client with scopes `kb:read`, `kb:write`, `offline_access`.
+
+Follow-up fixes on `main`:
+
+- `18cdd86` — CIMD is no longer advertised; native clients register through
+  DCR so the concrete loopback port is registered (OpenCode's CIMD document
+  lists only portless loopbacks).
+- `79bdd3a` — `kb_capture` lowercases the OAuth client-id segment of the
+  idempotency key (DCR IDs are mixed case; the event contract requires a
+  lowercase slug).
+
+Legacy `knowledgebase.itscatalyst.com` and phases 12-13 remain untouched
+pending the owner-confirmed retirement step.
 
 ## Baseline
 
