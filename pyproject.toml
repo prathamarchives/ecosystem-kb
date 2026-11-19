@@ -9,14 +9,14 @@ dependencies = [
     "graphiti-core==0.31.2",
     "falkordb>=1.8.2",
     "fastmcp==4.2.1",
-    "fastapi>=0.129,<0.130",
+    "fastapi>=0.165,<0.166",
     "uvicorn>=0.37,<1.0",
     "sqlalchemy>=2.0,<2.1",
     "aiosqlite>=0.21,<0.22",
     "asyncpg>=0.30,<0.31",
     "pydantic>=2.11,<3",
     "pydantic-settings>=2.12,<3",
-    "httpx>=0.29,<0.30",
+    "httpx>=0.28,<0.29",
 ]
 
 [project.optional-dependencies]
