@@ -177,3 +177,16 @@ class TestCliWiring:
 
         cli._cmd_nuke(type("A", (), {"yes": False})())
         assert "--yes" in capsys.readouterr().out  # plan §B4: destructive is separate+confirmed
+
+
+class TestEnvironmentHygiene:
+    def test_no_deployment_env_pollutes_test_cwd(self, tmp_path, monkeypatch):
+        """A stray .env in the working directory must not silently flip
+        test/dev apps into production mode (found live: a gitignored .env
+        made every server fixture fail startup with the token guard)."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("KB_ENVIRONMENT=production\n")
+        from ecosystem_kb.core.config import KbSettings
+
+        s = KbSettings(graph_database="x", environment="development")
+        assert s.environment == "development", "explicit override must win"

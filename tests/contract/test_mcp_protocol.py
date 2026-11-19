@@ -46,6 +46,7 @@ async def server(tmp_path):
             graph_port=embedded.port,
             graph_database="test_ns",
             llm_provider="fake",
+            environment="development",  # pin: never trust ambient .env
             default_namespace="ecosystem-dev",
             allowed_namespaces="ecosystem-dev",
             api_tokens="mcp-test-token",
