@@ -1,70 +1,63 @@
 # STATE.md — current implementation state
 
-Last updated: 2026-11-19 (feat/plug-and-play-local-tunnel, post main@5f4d499)
+Last updated: 2026-11-19 (repair/onboarding-host-cli, on top of main@ff32c93)
 
-## Status: plug-and-play milestone implemented on the branch; push/CI/merge pending
+## Baseline
 
-This branch implements the 2026-11-19 plug-and-play execution plan against
-verified main@5f4d499 (CI run 44461844352 green; baseline 113 tests / 2
-skipped re-verified in-sandbox before any change).
+`main@ff32c93` is the merged plug-and-play milestone (PR #1; CI runs
+44480930330 on the PR and 44481173378 on main, both green, 5/5 jobs:
+lint, unit, embedded-integration, postgres-integration, docker-build).
+In-sandbox verification at merge time: **141 passed / 2 skipped**, ruff
+clean, deployment drill 27/27.
 
-## Critical fix discovered by this work
-`/mcp` was NEVER reachable over HTTP on main (ADR-018): the FastMCP
-sub-app's lifespan (session-manager init) never ran because FastAPI's
-custom lifespan replaced it; tools could not resolve services (the mounted
-sub-app replaces scope["app"]); and protocol initialize succeeded with ANY
-or NO token. Existing tests called tool functions directly, and the drill
-only exercised REST, so this was invisible. Fixed via chained lifespan +
-mirrored sub-app state + McpAuthMiddleware (pre-protocol bearer
-validation: missing/invalid/revoked → 401 at initialize). Protocol-level
-tests over real uvicorn + Streamable HTTP now gate this.
+## This branch: final onboarding repair
 
-## What the branch delivers (plan § map)
-- WP-A: docs/GAP-REPORT.md, docs/PLUG-AND-PLAY-ACCEPTANCE.md, ADR-017.
-- WP-B: deploy/compose.local.yaml (pg 16.9-alpine, falkordb 4.22.1 pinned;
-  private network, no DB ports; healthchecks; one-shot migrate service;
-  restart policies; cloudflared behind `tunnel` profile), .env.example
-  regroup, full kb CLI (setup/up/down/restart/logs/status/doctor/nuke/
-  client create-list-revoke-rotate/connect/disconnect/tunnel/backup/
-  restore), EventRepository.queue_stats, client lifecycle in repos
-  (audited). Backup: real pg_dump + FalkorDB SAVE + manifest + checksums +
-  verify-then-atomic-publish; restore checksum-gated with live-volume
-  confirmation. Drill re-run: 27/27 (backup+restore into fresh instances).
-- WP-C: cloudflared 2025.11.1 service + docs/TUNNEL-SETUP.md (dashboard
-  steps, token handling, AT-02 verification, VM migration path).
-- WP-D: kb_context + kb_capture over the SAME service layer (per-client
-  source system:mcp:<client_id>, server-generated ids/idempotency, actor
-  from the authenticated credential, epistemic note); product-grade tool
-  descriptions; 9-tool surface; protocol tests.
-- WP-E: connect wizard + docs/clients/CONNECT.md + AGENT-INSTRUCTIONS.md.
-- WP-F: negatives — missing/invalid/revoked token 401 pre-protocol,
-  reader-cannot-capture, actor attribution from credential only, capture
-  goes through the secret-scan gate.
-- WP-G: 30-case labelled extraction eval + harness; LAW invariants
-  asserted, quality reported; docs/EVAL.md with real-provider runbook.
-- WP-H: kb status/doctor output per plan §12 (containers, MCP endpoint,
-  readiness, public URL, last backup, knowledge counts, queue depth).
+Problems fixed (all owner-facing, found by re-testing the milestone the
+way a real installation runs it):
 
-## Test state (in-sandbox, final run on branch)
-unit 60, contract 15 (incl. 11 protocol-over-HTTP), security 12,
-integration 32 + eval 3 → 122 passed / 2 skipped; ruff clean.
+1. **Dead control-plane path (§1).** The CLI's client-management/status/
+   doctor commands connected directly to `127.0.0.1:5432` — invalid with
+   PostgreSQL on a private Compose network. Replaced with the loopback
+   admin API (`/v1/admin/*`, kb:admin scope, audited, REST-only, never
+   MCP tools) + `kb-admin` client seeded by the compose migrate one-shot
+   from `KB_ADMIN_TOKEN` (ADR-019; docs/HOST-CLI-ARCHITECTURE.md).
+2. **API reachability (§2).** Compose now publishes
+   `127.0.0.1:${KB_BIND_PORT:-8000}:8000` (loopback only); the CLI reads
+   `KB_BIND_HOST/PORT` everywhere; DB ports remain unpublished.
+3. **Connect wizard (§3).** Client id defaults from the target; re-running
+   connect on an active client REFUSES to rotate without `--rotate`;
+   Cursor output is real valid JSON (parsed before display) with actual
+   endpoint/token; `--write/--path` merges into mcp.json preserving
+   unrelated servers; credentials printed exactly once.
+4. **Doctor severity split (§4).** Mandatory failures (API readiness, MCP
+   initialize, admin API, .env perms) vs WARN for local-only tunnel,
+   no-backup-yet, LLM=read-only; `--strict` escalates warnings.
+   A clean local-only install exits 0.
+5. **Install-path bug (found by host-level tests).** Deployment state
+   (.env, backups, compose reference) was derived from the installed
+   package location — `kb setup` from any other directory wrote config
+   into the source tree. Now anchored to the working directory; real
+   environment variables override .env values.
+
+## Test state (branch, final run)
+
+- unit 60, contract 21 (15 protocol + 6 admin-API over real HTTP),
+  security 12, integration 44 (32 + 9 host-subprocess + 3 extraction eval)
+  → **137 passed / 2 skipped**; ruff clean; drill 27/27.
+- CI now runs host CLI flows + the 30-case extraction eval (fake provider;
+  real-provider runbook in docs/EVAL.md). Docker-level §6 checks run on
+  the owner host via scripts/host_acceptance.sh (restart persistence, DB
+  port privacy, loopback-only bind, tunnel route).
 
 ## Honestly not done / limits
-1. Push + observed CI + merge — next action (this file documents the
-   pre-push state).
-2. Container-level acceptance (AT-01/02/06/07 literal Docker form) needs
-   the owner's host: no Docker daemon in the agent sandbox. The compose
-   file, drill, and kb doctor cover the equivalent logic in-sandbox.
-3. Named-tunnel live test (AT-02) requires the owner's Cloudflare domain +
-   token in local .env. Docs/TUNNEL-SETUP.md has the exact steps.
-4. Real-LLM extraction quality unmeasured (fake provider proves plumbing;
-   runbook in docs/EVAL.md).
-5. Sandbox was hard-recycled before this session: repos/, tools/, memory/,
-   .secrets/ were rebuilt from GitHub + conversation-held PAT.
+
+1. Container-level §6 items (real `kb up`, restart persistence, port
+   scans) execute on the owner's machine — no Docker daemon in the
+   sandbox. scripts/host_acceptance.sh automates them.
+2. Live named-tunnel check (§6.11) needs the owner's CF_TUNNEL_TOKEN.
+3. Real-LLM extraction quality still unmeasured (docs/EVAL.md runbook).
 
 ## Next actions
-1. Push feat/plug-and-play-local-tunnel; watch CI; merge after green.
-2. Owner: machine with Docker → kb setup / kb up / kb doctor (AT-01).
-3. Owner: Cloudflare tunnel per docs/TUNNEL-SETUP.md → kb tunnel status.
-4. Owner: connect clients per docs/clients/CONNECT.md (AT-03..05, 09).
-5. Real-provider eval baseline recorded in docs/EVAL.md.
+
+1. Merge this repair PR after CI green.
+2. Owner: `bash scripts/host_acceptance.sh` on the real machine.

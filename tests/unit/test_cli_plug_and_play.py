@@ -47,7 +47,8 @@ class TestSetup:
         assert len(pg.split("=", 1)[1]) >= 24 and len(fk.split("=", 1)[1]) >= 24
         out = capsys.readouterr().out
         assert "KB_LLM_API_KEY is empty" in out  # read-only warning
-        assert "Store it in a password manager" in out  # admin token shown once note
+        assert "READ-ONLY" in out  # repair §4: clear mode statement
+        assert "store the values in a password manager" in out
         # Admin token itself must be in the file but never printed.
         admin = [ln for ln in text.splitlines() if ln.startswith("KB_ADMIN_TOKEN=")][0]
         assert admin.split("=", 1)[1] not in out
@@ -176,3 +177,16 @@ class TestCliWiring:
 
         cli._cmd_nuke(type("A", (), {"yes": False})())
         assert "--yes" in capsys.readouterr().out  # plan §B4: destructive is separate+confirmed
+
+
+class TestEnvironmentHygiene:
+    def test_no_deployment_env_pollutes_test_cwd(self, tmp_path, monkeypatch):
+        """A stray .env in the working directory must not silently flip
+        test/dev apps into production mode (found live: a gitignored .env
+        made every server fixture fail startup with the token guard)."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("KB_ENVIRONMENT=production\n")
+        from ecosystem_kb.core.config import KbSettings
+
+        s = KbSettings(graph_database="x", environment="development")
+        assert s.environment == "development", "explicit override must win"

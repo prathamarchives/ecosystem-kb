@@ -177,3 +177,21 @@ HTTP: the mount's lifespan never ran and tools could not resolve services.
 Protocol-level tests (real uvicorn + Streamable HTTP) now gate this. Auth
 runs pre-protocol because initialize itself carries no tool call where the
 service layer could reject a forged token (plan §F-1).
+
+## ADR-019 · Host CLI operates the control plane through a loopback admin API; databases stay network-private
+**Status:** Accepted (2026-11-19). **Decision:** the host `kb` CLI never
+connects to PostgreSQL or FalkorDB. Privileged client-management and stats
+operations call `/v1/admin/*` on the API published at
+`127.0.0.1:${KB_BIND_PORT:-8000}` (loopback only), authenticated with the
+`kb_ADMIN_TOKEN` credential seeded idempotently into `kb-admin` by the
+compose `migrate` one-shot (`kb bootstrap --seed-admin` for direct
+deployments). Admin routes require `kb:admin`, are audited, return
+credentials once, and are REST-only — never MCP tools, so MCP clients
+cannot mint credentials regardless of scope. Compose control (up/down/
+logs/backup/restore) goes through `docker compose` and the Docker socket.
+Deployment state (.env, backups, compose reference) anchors to the working
+directory the owner runs `kb` from; environment variables override .env.
+**Alternatives rejected:** one-shot management container (re-implements
+credential handling, local-only, worse failure modes — reasoning recorded
+in docs/HOST-CLI-ARCHITECTURE.md); publishing 5432 on loopback (weaker
+boundary, still wrong for remote-owner scenarios).

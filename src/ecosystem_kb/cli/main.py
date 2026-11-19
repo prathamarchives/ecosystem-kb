@@ -1,12 +1,16 @@
 """CLI: stack lifecycle, client management, connection wizard, backup/restore.
 
-Design notes (plug-and-play plan §B4/E2):
-- `kb up/down/status/...` are thin wrappers around Docker Compose with the
-  local profile `deploy/compose.local.yaml`; no second orchestrator.
-- Secrets live in the untracked .env; nothing here ever prints them after
-  generation (rotate explicitly to see a new one).
-- Commands that touch the control plane reuse the same repositories and
-  migrations as the API (no parallel schema path).
+Architecture (ADR-019 — onboarding repair): the host CLI NEVER connects to
+PostgreSQL or FalkorDB directly. The local Compose deployment keeps both on
+a private Docker network with no published ports; the only host-reachable
+surface is the API on 127.0.0.1:<KB_BIND_PORT> (loopback, not LAN).
+Privileged client-management operations go through /v1/admin/* with the
+KB_ADMIN_TOKEN credential (kb:admin scope, audited). Compose-control
+commands (up/down/logs/backup/restore) shell out to `docker compose`,
+which talks to the Docker socket, not the databases.
+
+Secrets live in the untracked .env; nothing here ever prints them after
+generation (rotate explicitly to see a new one).
 """
 
 from __future__ import annotations
@@ -26,11 +30,20 @@ from ecosystem_kb.adapters.graphiti.health import check_graph
 from ecosystem_kb.adapters.postgres.repositories import ControlPlane, Repositories
 from ecosystem_kb.core.config import get_settings
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-COMPOSE_LOCAL = REPO_ROOT / "deploy" / "compose.local.yaml"
-ENV_PATH = REPO_ROOT / ".env"
-ENV_EXAMPLE = REPO_ROOT / ".env.example"
-BACKUP_ROOT = REPO_ROOT / "backups"
+# Deployment state belongs to the DIRECTORY THE OWNER RUNS `kb` FROM (the
+# deployment checkout), never to the installed package's source tree.
+# Repair finding: deriving these from __file__ silently wrote .env into
+# site-packages on non-editable installs — or into the source tree when
+# running from elsewhere — so neither the stack nor the CLI saw the same
+# configuration.
+DEPLOY_ROOT = Path.cwd()
+COMPOSE_LOCAL = DEPLOY_ROOT / "deploy" / "compose.local.yaml"
+ENV_PATH = DEPLOY_ROOT / ".env"
+ENV_EXAMPLE = DEPLOY_ROOT / ".env.example"
+BACKUP_ROOT = DEPLOY_ROOT / "backups"
+REPO_ROOT = Path(__file__).resolve().parents[3]  # installed source tree
+
+ADMIN_CLIENT_ID = "kb-admin"
 
 
 # --------------------------------------------------------------------------
@@ -41,7 +54,7 @@ BACKUP_ROOT = REPO_ROOT / "backups"
 def _compose(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     """Run docker compose against the local profile from the repo root."""
     cmd = ["docker", "compose", "-f", str(COMPOSE_LOCAL), *args]
-    return subprocess.run(cmd, cwd=REPO_ROOT, check=check)
+    return subprocess.run(cmd, cwd=DEPLOY_ROOT, check=check)
 
 
 def _compose_profile(*args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -49,7 +62,8 @@ def _compose_profile(*args: str, check: bool = True) -> subprocess.CompletedProc
 
 
 def _load_env() -> dict[str, str]:
-    """Minimal .env parser (no dependency on dotenv)."""
+    """Deployment .env values, with real environment variables taking
+    precedence (CI and tests override without rewriting files)."""
     values: dict[str, str] = {}
     if ENV_PATH.exists():
         for line in ENV_PATH.read_text().splitlines():
@@ -58,6 +72,7 @@ def _load_env() -> dict[str, str]:
                 continue
             k, _, v = line.partition("=")
             values[k.strip()] = v.strip()
+    values.update({k: v for k, v in os.environ.items() if k.startswith(("KB_", "CF_"))})
     return values
 
 
@@ -76,43 +91,64 @@ def _env_repl(k: str, v: str) -> None:
     ENV_PATH.write_text("\n".join(out) + "\n")
 
 
-def _settings_from_env():
-    from ecosystem_kb.core.config import KbSettings
+def _api_base() -> str:
+    """Local API base URL — loopback by default (ADR-019; repair §2)."""
+    env = _load_env()
+    host = env.get("KB_BIND_HOST", "127.0.0.1")
+    port = env.get("KB_BIND_PORT", "8000")
+    return f"http://{host}:{port}"
+
+
+class AdminApiError(RuntimeError):
+    """Admin API returned an error payload the CLI should surface."""
+
+
+async def _admin_request(method: str, path: str, json_body: dict | None = None) -> dict:
+    """Authenticated call to /v1/admin/* on the local loopback API."""
+    import httpx
 
     env = _load_env()
-    overrides = {
-        "database_url": env.get(
-            "KB_DATABASE_URL",
-            f"postgresql+asyncpg://kb:{env.get('POSTGRES_PASSWORD', '')}@127.0.0.1:5432/ecosystem_kb",
-        ),
-        "graph_host": env.get("KB_GRAPH_HOST", "127.0.0.1"),
-        "graph_port": int(env.get("KB_GRAPH_PORT", "6379")),
-        "graph_password": env.get("FALKORDB_PASSWORD") or None,
-        "graph_database": env.get("KB_NAMESPACE", "ecosystem_prod"),
-        "environment": env.get("KB_ENVIRONMENT", "production"),
-        "llm_provider": env.get("KB_LLM_PROVIDER", "fake"),
-        "llm_model": env.get("KB_LLM_MODEL", "fake-extractor"),
-        "llm_api_key": env.get("KB_LLM_API_KEY") or None,
-        "embedder_model": env.get("KB_EMBEDDER_MODEL", "fake-embedder"),
-    }
-    return KbSettings(**overrides)
+    token = env.get("KB_ADMIN_TOKEN", "")
+    if not token:
+        raise AdminApiError(
+            "KB_ADMIN_TOKEN is missing from .env — run `kb setup`, then `kb up` "
+            "(the API seeds the admin client from the token at startup)"
+        )
+    try:
+        r = await httpx.AsyncClient(timeout=15).request(
+            method,
+            f"{_api_base()}{path}",
+            headers={"Authorization": f"Bearer {token}"},
+            json=json_body,
+        )
+    except httpx.ConnectError as exc:
+        raise AdminApiError(
+            f"cannot reach the local API at {_api_base()} — is the stack up? (`kb up`)"
+        ) from exc
+    if r.status_code == 401:
+        raise AdminApiError(
+            "admin credential rejected — if KB_ADMIN_TOKEN was regenerated in .env, "
+            "re-run with the token the API knows, or `kb up` again to re-seed"
+        )
+    try:
+        body = r.json()
+    except Exception:
+        body = {}
+    if r.status_code >= 400:
+        detail = body.get("message") or body.get("detail") or r.text[:200]
+        raise AdminApiError(f"admin API error ({r.status_code}): {detail}")
+    return body
 
 
-async def _open_control_plane():
-    """Control plane + repositories using .env settings (migrations applied)."""
-    from ecosystem_kb.adapters.postgres.migrations import migrate
-    from ecosystem_kb.adapters.postgres.repositories import ControlPlane, Repositories
+def _api_json(path: str) -> dict | None:
+    """Sync unauthenticated GET (health/ready) for status display."""
+    import httpx
 
-    settings = _settings_from_env()
-    cp = ControlPlane(settings.database_url)
-    await migrate(cp.engine)
-    return cp, Repositories(cp), settings
-
-
-def _llm_status(settings) -> str:
-    if (settings.llm_api_key or "") == "":
-        return "missing (KB runs read-only: search/context OK, extraction disabled)"
-    return f"configured (provider={settings.llm_provider}, model={settings.llm_model})"
+    try:
+        r = httpx.get(f"{_api_base()}{path}", timeout=5)
+        return r.json() if r.status_code == 200 else None
+    except Exception:
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -129,30 +165,24 @@ def _cmd_setup(args) -> None:
         shutil.copyfile(ENV_EXAMPLE, ENV_PATH)
         _env_repl("POSTGRES_PASSWORD", pysecrets.token_urlsafe(24))
         _env_repl("FALKORDB_PASSWORD", pysecrets.token_urlsafe(24))
+        _env_repl("KB_ADMIN_TOKEN", pysecrets.token_urlsafe(32))
         os.chmod(ENV_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 0600
-        print(f"created .env with generated secrets (mode 0600): {ENV_PATH}")
+        print(f"created .env with generated secrets incl. KB_ADMIN_TOKEN (mode 0600): {ENV_PATH}")
+        print("store the values in a password manager now — they are NOT printed again")
 
     env = _load_env()
-    # LLM/embedding validation: warn, do not block (plan §B2).
+    # LLM/embedding validation: warn, do not block (repair §4).
     if not env.get("KB_LLM_API_KEY"):
         print(
-            "WARNING: KB_LLM_API_KEY is empty — ingestion/extraction is DISABLED.\n"
-            "         Search and context retrieval still work. Add the key to .env\n"
-            "         and run `kb restart` to enable full capture processing."
+            "NOTE: KB_LLM_API_KEY is empty — the KB will run READ-ONLY\n"
+            "      (search/context work; extraction of new captures is disabled).\n"
+            "      Add the key to .env and `kb restart` to enable full processing."
         )
     if not env.get("CF_TUNNEL_TOKEN"):
         print(
-            "NOTE: CF_TUNNEL_TOKEN is not set — the Cloudflare tunnel profile stays\n"
-            "      off. See docs/TUNNEL-SETUP.md to add it later (never commit it)."
+            "NOTE: CF_TUNNEL_TOKEN is not set — local-only mode. The Cloudflare\n"
+            "      tunnel profile stays off; add it later (docs/TUNNEL-SETUP.md)."
         )
-    if not env.get("KB_ADMIN_TOKEN"):
-        tok = pysecrets.token_urlsafe(32)
-        _env_repl("KB_ADMIN_TOKEN", tok)
-        print(
-            "generated KB_ADMIN_TOKEN (admin CLI/API credential).\n"
-            "Store it in a password manager now — it is NOT printed again."
-        )
-        os.chmod(ENV_PATH, stat.S_IRUSR | stat.S_IWUSR)
 
 
 # --------------------------------------------------------------------------
@@ -200,24 +230,12 @@ def _cmd_nuke(args) -> None:
 # --------------------------------------------------------------------------
 
 
-async def _api_json(path: str) -> dict | None:
-    import httpx
-
-    env = _load_env()
-    base = env.get("KB_LOCAL_URL", "http://127.0.0.1:8000")
-    try:
-        r = await httpx.AsyncClient(timeout=5).get(f"{base}{path}")
-        return r.json() if r.status_code == 200 else None
-    except Exception:
-        return None
-
-
 def _container_states() -> dict[str, str]:
     """service -> health from `docker compose ps --format json`."""
     try:
         out = subprocess.run(
             ["docker", "compose", "-f", str(COMPOSE_LOCAL), "ps", "-a", "--format", "json"],
-            cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+            cwd=DEPLOY_ROOT, capture_output=True, text=True, check=True,
         ).stdout.strip()
     except Exception:
         return {}
@@ -244,111 +262,126 @@ async def _cmd_status(args) -> None:
     line("PostgreSQL", states.get("postgres", "not created"))
     line("FalkorDB", states.get("falkordb", "not created"))
     line("Worker", states.get("worker", "not created"))
-    line("Cloudflared", states.get("cloudflared", "off (no token)" if not env.get("CF_TUNNEL_TOKEN") else "not created"))
+    line("Cloudflared", states.get("cloudflared", "off (local-only mode)" if not env.get("CF_TUNNEL_TOKEN") else "not created"))
     mcp_ok = await _mcp_probe()
     line("MCP endpoint", "healthy (initialize ok)" if mcp_ok else "not reachable on the local port")
-    ready = await _api_json("/ready")
+    ready = _api_json("/ready")
     if ready:
         line("Readiness", "ready" if ready.get("ready") else "degraded")
         for k, v in ready.get("checks", {}).items():
             line(f"  {k}", str(v))
     else:
-        line("Readiness", "api not reachable on the local port")
+        line("Readiness", f"api not reachable on {_api_base()}")
     if env.get("KB_PUBLIC_URL"):
         line("Public URL", env["KB_PUBLIC_URL"] + "/mcp")
     line("Last backup", _last_backup() or "none yet — run `kb backup`")
-    # Knowledge + queue snapshot through the control plane.
+    # Knowledge + queue snapshot through the admin API (no direct DB access).
     try:
-        cp, repos, _ = await _open_control_plane()
-    except Exception as exc:
-        line("Knowledge", f"control plane unreachable: {str(exc)[:80]}")
-        return
-    try:
-        counts = await repos.cp.table_counts()
-        line("Knowledge", f"{counts.get('kb_entities', 0)} entities / {counts.get('kb_provenance_links', 0)} provenance links")
-        stats = await repos.events.queue_stats()
-        line("Queue", f"{stats.get('queued', 0)} pending / {stats.get('dead_letter', 0)} dead-letter")
-    finally:
-        await cp.dispose()
+        stats = await _admin_request("GET", "/v1/admin/stats")
+        k = stats["knowledge"]
+        q = stats["queue"]
+        line("Knowledge", f"{k['entities']} entities / {k['provenance_links']} provenance links")
+        line("Queue", f"{q.get('queued', 0)} pending / {q.get('dead_letter', 0)} dead-letter")
+    except AdminApiError as exc:
+        line("Knowledge", f"unavailable: {str(exc)[:90]}")
 
 
 async def _cmd_doctor(args) -> None:
+    """Deep diagnostics. Mandatory service failures exit 1; optional
+    configuration gaps print as WARN (repair §4):
+    - local-only mode (no CF_TUNNEL_TOKEN) is healthy by design;
+    - no backup yet is a warning until the first backup exists;
+    - missing LLM credentials mean read-only/extraction-disabled operation.
+    --strict turns provisioned-deployment gaps into failures."""
     env = _load_env()
-    ok = True
+    failures: list[str] = []
+    warnings: list[str] = []
 
     def check(name: str, passed: bool, detail: str = "") -> None:
-        nonlocal ok
-        ok = ok and passed
         print(f"[{'PASS' if passed else 'FAIL'}] {name}" + (f" — {detail}" if detail and args.verbose else ""))
+        if not passed:
+            failures.append(name)
 
-    check("docker engine", shutil.which("docker") is not None)
-    try:
-        _compose("version", check=False)
-        check("docker compose", True)
-    except Exception:
-        check("docker compose", False)
+    def warn(name: str, detail: str) -> None:
+        print(f"[WARN] {name}" + (f" — {detail}" if detail and args.verbose else ""))
+        warnings.append(name)
 
+    # -- .env is mandatory for any deployment mode.
     check(".env exists with 0600", ENV_PATH.exists() and (stat.S_IMODE(ENV_PATH.stat().st_mode) & 0o077) == 0)
 
-    # Control plane: connectivity + schema version.
-    try:
-        cp, repos, settings = await _open_control_plane()
-        check("postgres connectivity + migrations", True)
-        from ecosystem_kb.adapters.postgres.migrations import load_migrations
+    # -- Docker/compose only matter for the local Compose deployment.
+    if shutil.which("docker") is None:
+        warn("docker engine", "not found — required for `kb up` on this machine")
+    else:
+        try:
+            _compose("version", check=False)
+            check("docker compose", True)
+        except Exception:
+            check("docker compose", False)
 
-        check("schema version", len(load_migrations()) >= 2, f"{len(load_migrations())} migrations registered")
-    except Exception as exc:
-        check("postgres connectivity + migrations", False, str(exc)[:120])
-        return
-
-    try:
-        from ecosystem_kb.adapters.graphiti.client import build_graphiti
-        from ecosystem_kb.adapters.graphiti.health import check_graph
-
-        graphiti = build_graphiti(settings)
-        health = await check_graph(graphiti, settings.graph_database)
-        check("falkordb connectivity + graphiti init", health.ok, str(health.detail)[:100])
-        await graphiti.close()
-    except Exception as exc:
-        check("falkordb connectivity + graphiti init", False, str(exc)[:120])
-
-    ready = await _api_json("/ready")
+    # -- API is the single mandatory service surface.
+    ready = _api_json("/ready")
     check("API readiness", ready is not None and bool(ready.get("ready")))
+    if ready and not ready.get("ready"):
+        for k, v in ready.get("checks", {}).items():
+            print(f"       {k}: {str(v)[:120]}")
 
-    # MCP protocol initialization over the same HTTP app (AT-03 equivalent).
     mcp_ok = await _mcp_probe()
     check("MCP endpoint responds to initialize", mcp_ok)
 
+    # -- Admin credential works through the API (no direct DB path exists).
+    admin_ok = False
     try:
-        stats = await repos.events.queue_stats()
-        check("worker heartbeat / queue", True, f"pending={stats.get('pending', 0)} dead={stats.get('dead_letter', 0)}")
-    except Exception as exc:
-        check("worker heartbeat / queue", False, str(exc)[:120])
+        stats = await _admin_request("GET", "/v1/admin/stats")
+        admin_ok = True
+        q = stats["queue"]
+        print(f"[PASS] admin API + control plane — pending={q.get('queued', 0)} dead={q.get('dead_letter', 0)}")
+    except AdminApiError as exc:
+        check("admin API + control plane", False, str(exc)[:120])
 
-    check("LLM extraction config", bool(env.get("KB_LLM_API_KEY")), _llm_status(settings))
-    check("tunnel token", True, "configured" if env.get("CF_TUNNEL_TOKEN") else "missing (tunnel profile off; see docs/TUNNEL-SETUP.md)")
+    # -- optional configuration (repair §4): warnings unless --strict.
+    if env.get("CF_TUNNEL_TOKEN"):
+        states = _container_states()
+        t_state = states.get("cloudflared", "not running")
+        if t_state == "running" or t_state == "healthy":
+            print("[PASS] cloudflared tunnel — running")
+        else:
+            (check if args.strict else warn)("cloudflared tunnel", f"token set but container {t_state}")
+    else:
+        warn("cloudflared tunnel", "not configured — LOCAL-ONLY mode (healthy; see docs/TUNNEL-SETUP.md)")
 
-    states = _container_states()
-    check("persistence volumes", True, f"postgres={states.get('postgres', '?')} falkordb={states.get('falkordb', '?')} (volumes postgres_data, falkordb_data)")
+    if not env.get("KB_LLM_API_KEY"):
+        warn("LLM extraction config", "missing — READ-ONLY mode: search/context OK, extraction of captures disabled")
+    else:
+        print(f"[PASS] LLM extraction config — provider={env.get('KB_LLM_PROVIDER')}, model={env.get('KB_LLM_MODEL')}")
 
     last = _last_backup()
-    check("last backup", last is not None, last or "no backup found yet — run `kb backup`")
+    if last is None:
+        warn("last backup", "no backup yet — run `kb backup`")
+    else:
+        print(f"[PASS] last backup — {last}")
 
-    await cp.dispose()
-    print("\ndoctor: " + ("all checks passed" if ok else "FAILURES PRESENT — see above"))
-    sys.exit(0 if ok else 1)
+    states = _container_states()
+    print(f"[{'PASS' if admin_ok else 'WARN'}] persistence volumes — postgres={states.get('postgres', '?')} falkordb={states.get('falkordb', '?')}")
+
+    print(
+        f"\ndoctor: {len(failures)} failure(s), {len(warnings)} warning(s)"
+        + (" — FAILURES PRESENT" if failures else " — healthy" + (" (local-only)" if not env.get("CF_TUNNEL_TOKEN") else ""))
+    )
+    if args.strict and warnings:
+        print("strict mode: warnings are treated as failures for fully provisioned deployments")
+    sys.exit(1 if failures or (args.strict and warnings) else 0)
 
 
 async def _mcp_probe() -> bool:
-    """Protocol-level MCP initialize over the local API port."""
+    """Protocol-level MCP initialize over the local loopback API port."""
     env = _load_env()
     token = env.get("KB_ADMIN_TOKEN", "")
-    base = env.get("KB_LOCAL_URL", "http://127.0.0.1:8000")
     try:
         import httpx
 
         r = await httpx.AsyncClient(timeout=10).post(
-            f"{base}/mcp/",
+            f"{_api_base()}/mcp/",
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
@@ -401,83 +434,143 @@ disputed) — respect it when reasoning about what is established.
 
 
 async def _cmd_client(args) -> None:
-    cp, repos, _ = await _open_control_plane()
     try:
         if args.client_cmd == "create":
-            from contracts.clients import ROLE_SCOPES
-
-            scopes = ROLE_SCOPES.get(args.role, ["kb:read"])
-            namespaces = _load_env().get("KB_NAMESPACE", "ecosystem_prod").split(",")
-            try:
-                token = await repos.clients.register(
-                    args.client_id, args.name or args.client_id, scopes, namespaces
-                )
-            except Exception as exc:
-                sys.exit(f"could not register client: {exc}")
-            print(f"client '{args.client_id}' created with scopes {scopes}")
-            print(f"bearer token (shown ONCE, store it now): {token}")
+            body = await _admin_request("POST", "/v1/admin/clients", {
+                "client_id": args.client_id,
+                "client_name": args.name,
+                "role": args.role,
+            })
+            print(f"client '{body['client_id']}' created with scopes {body['scopes']}")
+            print(f"bearer token (shown ONCE, store it now): {body['token']}")
             print(f"rotate later with: kb client rotate {args.client_id}")
         elif args.client_cmd == "list":
-            rows = await repos.clients.list_clients()
+            body = await _admin_request("GET", "/v1/admin/clients")
+            rows = body["clients"]
             if not rows:
                 print("no clients registered")
             for c in rows:
-                print(f"{c.client_id:<24} {c.status:<10} scopes={','.join(c.scopes)} namespaces={','.join(c.allowed_namespaces)}")
+                print(f"{c['client_id']:<24} {c['status']:<10} scopes={','.join(c['scopes'])} namespaces={','.join(c['allowed_namespaces'])}")
         elif args.client_cmd == "revoke":
-            row = await repos.clients.set_status(args.client_id, "revoked", actor="owner-cli")
-            sys.exit(f"no such client: {args.client_id}") if row is None else print(f"client '{args.client_id}' revoked")
+            body = await _admin_request("POST", f"/v1/admin/clients/{args.client_id}/revoke")
+            print(f"client '{body['client_id']}' revoked ({body['status']})")
         elif args.client_cmd == "rotate":
-            token = await repos.clients.rotate_token(args.client_id, actor="owner-cli")
-            sys.exit(f"no such client: {args.client_id}") if token is None else print(f"new token (shown ONCE): {token}")
-    finally:
-        await cp.dispose()
+            body = await _admin_request("POST", f"/v1/admin/clients/{args.client_id}/rotate")
+            print(f"new token for '{body['client_id']}' (shown ONCE): {body['token']}")
+    except AdminApiError as exc:
+        sys.exit(str(exc))
+
+
+def _default_client_name(target: str) -> str:
+    """Repair §3: default the client identifier from the selected target."""
+    return {"claude-code": "claude-code", "cursor": "cursor"}.get(target, "mcp-client")
+
+
+def _cursor_config(endpoint: str, token: str) -> dict:
+    """Cursor mcp.json fragment for this KB only — merged, never replacing
+    unrelated servers (repair §3)."""
+    return {
+        "mcpServers": {
+            "ecosystem-kb": {
+                "url": endpoint,
+                "headers": {"Authorization": f"Bearer {token}"},
+            }
+        }
+    }
+
+
+def _merge_mcp_json(path: Path, fragment: dict) -> dict:
+    """Read existing mcp.json (if any), merge our server entry, keep the rest."""
+    import json
+
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text())
+            if not isinstance(existing, dict):
+                existing = {}
+        except json.JSONDecodeError:
+            sys.exit(f"{path} is not valid JSON — fix or remove it first (nothing was written)")
+    else:
+        existing = {}
+    servers = existing.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    servers.update(fragment["mcpServers"])
+    merged = dict(existing)
+    merged["mcpServers"] = servers
+    return merged
 
 
 async def _cmd_connect(args) -> None:
     env = _load_env()
-    public = env.get("KB_PUBLIC_URL", "https://kb.YOUR-DOMAIN.example")
-    endpoint = f"{public}/mcp"
-    cp, repos, _ = await _open_control_plane()
-    try:
-        existing = [c for c in await repos.clients.list_clients() if c.client_id == args.name]
-        if existing:
-            if existing[0].status != "active":
-                sys.exit(f"client '{args.name}' is {existing[0].status}; rotate or create a new one")
-            print(f"client '{args.name}' already exists — creating a fresh token (old one stops working)")
-            token = await repos.clients.rotate_token(args.name, actor="owner-cli")
-        else:
-            from contracts.clients import ROLE_SCOPES
+    name = args.name or _default_client_name(args.target)
+    public = env.get("KB_PUBLIC_URL")
+    endpoint = f"{public}/mcp" if public else f"{_api_base()}/mcp"
 
-            scopes = ROLE_SCOPES["contributor"]
-            namespaces = env.get("KB_NAMESPACE", "ecosystem_prod").split(",")
-            token = await repos.clients.register(args.name, args.name, scopes, namespaces)
-            print(f"client '{args.name}' created with scopes {scopes}")
-    finally:
-        await cp.dispose()
+    existing = None
+    try:
+        listed = await _admin_request("GET", "/v1/admin/clients")
+        existing = next((c for c in listed["clients"] if c["client_id"] == name), None)
+    except AdminApiError as exc:
+        sys.exit(str(exc))
+
+    if existing is not None:
+        if existing["status"] != "active":
+            sys.exit(
+                f"client '{name}' is {existing['status']} — create a differently-named client\n"
+                f"or reactivate it via the admin API before connecting."
+            )
+        if not args.rotate:
+            sys.exit(
+                f"client '{name}' already exists and is active.\n"
+                f"Re-running connect would rotate its credential and invalidate every\n"
+                f"configuration that still uses the old token.\n"
+                f"If you LOST the token, re-run with --rotate to issue a fresh one."
+            )
+        body = await _admin_request("POST", f"/v1/admin/clients/{name}/rotate")
+        token = body["token"]
+        print(f"rotated credential for '{name}' — the previous token stops working immediately")
+    else:
+        body = await _admin_request("POST", "/v1/admin/clients", {
+            "client_id": name,
+            "role": "contributor",
+        })
+        token = body["token"]
+        print(f"client '{name}' created with scopes {body['scopes']}")
 
     print(f"bearer token (shown ONCE): {token}\n")
+
     if args.target == "claude-code":
         snippet_cmd = (
-            f'claude mcp add --transport http ecosystem-kb {endpoint} \\\n'
+            f"claude mcp add --transport http ecosystem-kb {endpoint} \\\n"
             f'  --header "Authorization: Bearer {token}"'
         )
         print("Run this in your terminal:\n")
         print(snippet_cmd)
         print("\nThen add the usage instructions to your global rules:")
-        print("  claude config set globalInstructions - < docs/clients/AGENT-INSTRUCTIONS.md  # or paste manually")
+        print("  paste docs/clients/AGENT-INSTRUCTIONS.md into your rules file")
     elif args.target == "cursor":
-        snippet = (
-            "{\n"
-            '  "mcpServers": {\n'
-            '    "ecosystem-kb": {\n'
-            '      "url": f"{endpoint}",\n'
-            '      "headers": { "Authorization": f"Bearer {token}" }\n'
-            "    }\n"
-            "  }\n"
-            "}"
-        )
-        print("Add to ~/.cursor/mcp.json (or project .cursor/mcp.json):\n")
-        print(snippet)
+        # Repair §3: VALID JSON with real values, parsed back before display,
+        # optionally written into an mcp.json that preserves other servers.
+        import json
+
+        fragment = _cursor_config(endpoint, token)
+        config = fragment  # display-only by default
+        target_path: Path | None = None
+        if args.write:
+            target_path = Path(args.path).expanduser() if args.path else Path.home() / ".cursor" / "mcp.json"
+            config = _merge_mcp_json(target_path, fragment)
+        rendered = json.dumps(config, indent=2)
+        json.loads(rendered)  # validate before displaying (repair §3)
+        if target_path is not None:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_text(rendered + "\n")
+            print(f"merged ecosystem-kb server into {target_path} (existing servers preserved)")
+        else:
+            print("Add to ~/.cursor/mcp.json (or project .cursor/mcp.json):\n")
+        print(rendered)
+        if not target_path:
+            print("\ntip: `kb connect cursor --write` merges this into ~/.cursor/mcp.json automatically")
     else:  # generic
         snippet = (
             "MCP endpoint (Streamable HTTP):\n"
@@ -488,20 +581,21 @@ async def _cmd_connect(args) -> None:
             "       kb_get_context, kb_propose_update, kb_get_maintenance_report, kb_submit_event"
         )
         print(snippet)
-    (REPO_ROOT / "docs" / "clients").mkdir(parents=True, exist_ok=True)
-    (REPO_ROOT / "docs" / "clients" / "AGENT-INSTRUCTIONS.md").write_text(CLIENT_SNIPPET)
-    print("\nusage instructions written to docs/clients/AGENT-INSTRUCTIONS.md")
+
+    instructions = DEPLOY_ROOT / "docs" / "clients" / "AGENT-INSTRUCTIONS.md"
+    if not instructions.exists():
+        (DEPLOY_ROOT / "docs" / "clients").mkdir(parents=True, exist_ok=True)
+        instructions.write_text(CLIENT_SNIPPET)
+        print("\nusage instructions written to docs/clients/AGENT-INSTRUCTIONS.md")
 
 
 async def _cmd_disconnect(args) -> None:
-    cp, repos, _ = await _open_control_plane()
+    name = args.client_name
     try:
-        row = await repos.clients.set_status(args.client_name, "revoked", actor="owner-cli")
-        print(f"client '{args.client_name}' revoked — its MCP connections stop authenticating")
-        if row is None:
-            sys.exit(f"no such client: {args.client_name}")
-    finally:
-        await cp.dispose()
+        await _admin_request("POST", f"/v1/admin/clients/{name}/revoke")
+    except AdminApiError as exc:
+        sys.exit(str(exc))
+    print(f"client '{name}' revoked — its MCP connections stop authenticating immediately")
 
 
 # --------------------------------------------------------------------------
@@ -529,7 +623,7 @@ def _cmd_tunnel(args) -> None:
 def _psql_docker(*parts: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_LOCAL), "exec", "-T", "postgres", *parts],
-        cwd=REPO_ROOT, capture_output=True, text=True, check=check,
+        cwd=DEPLOY_ROOT, capture_output=True, text=True, check=check,
     )
 
 
@@ -551,7 +645,7 @@ def _cmd_backup(args) -> None:
     r = subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_LOCAL), "exec", "-T", "postgres",
          "pg_dump", "-U", "kb", "-d", "ecosystem_kb"],
-        cwd=REPO_ROOT, capture_output=True,
+        cwd=DEPLOY_ROOT, capture_output=True,
     )
     if r.returncode != 0 or not r.stdout:
         sys.exit(f"pg_dump FAILED — no backup written. {r.stderr.decode()[:300]}")
@@ -561,21 +655,21 @@ def _cmd_backup(args) -> None:
     r = subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_LOCAL), "exec", "-T", "falkordb",
          "redis-cli", "-a", _load_env().get("FALKORDB_PASSWORD", ""), "--no-auth-warning", "SAVE"],
-        cwd=REPO_ROOT, capture_output=True, text=True,
+        cwd=DEPLOY_ROOT, capture_output=True, text=True,
     )
     if "OK" not in r.stdout:
         sys.exit(f"FalkorDB SAVE FAILED — no backup written. {r.stdout[:200]} {r.stderr[:200]}")
     rdb_tmp = tmp / "falkordb.rdb"
     rc = subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_LOCAL), "cp", "falkordb:/data/dump.rdb", str(rdb_tmp)],
-        cwd=REPO_ROOT, capture_output=True,
+        cwd=DEPLOY_ROOT, capture_output=True,
     )
     if rc.returncode != 0 or not rdb_tmp.exists() or rdb_tmp.stat().st_size == 0:
         sys.exit(f"FalkorDB RDB copy FAILED — no backup written. {rc.stderr.decode()[:300]}")
 
     # 3. Manifest with checksums (app version from pyproject).
     version = "unknown"
-    pyproject = REPO_ROOT / "pyproject.toml"
+    pyproject = DEPLOY_ROOT / "pyproject.toml"
     if pyproject.exists():
         for line in pyproject.read_text().splitlines():
             if line.startswith("version"):
@@ -637,22 +731,22 @@ def _cmd_restore(args) -> None:
     print("checksums verified; restoring into live volumes…")
     _compose_profile("down")
     # Postgres: recreate volume, boot postgres only, restore dump.
-    subprocess.run(["docker", "volume", "rm", "ecosystem-kb_postgres_data"], cwd=REPO_ROOT, check=True)
+    subprocess.run(["docker", "volume", "rm", "ecosystem-kb_postgres_data"], cwd=DEPLOY_ROOT, check=True)
     _compose("up", "-d", "--wait", "postgres")
     r = subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_LOCAL), "exec", "-T", "postgres",
          "psql", "-U", "kb", "-d", "ecosystem_kb", "-v", "ON_ERROR_STOP=1"],
-        cwd=REPO_ROOT, input=(src / "control_plane.sql").read_text(),
+        cwd=DEPLOY_ROOT, input=(src / "control_plane.sql").read_text(),
         capture_output=True, text=True,
     )
     if r.returncode != 0:
         sys.exit(f"psql restore FAILED: {r.stderr[:400]}")
     # FalkorDB: copy RDB into the data volume, restart to load it.
-    subprocess.run(["docker", "volume", "rm", "ecosystem-kb_falkordb_data"], cwd=REPO_ROOT, check=True)
+    subprocess.run(["docker", "volume", "rm", "ecosystem-kb_falkordb_data"], cwd=DEPLOY_ROOT, check=True)
     _compose("up", "-d", "--wait", "falkordb")
     subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_LOCAL), "cp", str(src / "falkordb.rdb"), "falkordb:/data/dump.rdb"],
-        cwd=REPO_ROOT, check=True,
+        cwd=DEPLOY_ROOT, check=True,
     )
     _compose("restart", "falkordb")
     _compose("up", "-d", "--wait")
@@ -664,12 +758,24 @@ def _cmd_restore(args) -> None:
 # --------------------------------------------------------------------------
 
 
-async def _bootstrap(settings, dev_token: str | None) -> None:
+async def _bootstrap(settings, dev_token: str | None, seed_admin: bool = False) -> None:
     cp = ControlPlane(settings.database_url)
     from ecosystem_kb.adapters.postgres.migrations import migrate
 
     await migrate(cp.engine)
-    if not dev_token:  # --migrate-only skips client seeding
+    if seed_admin:
+        # Repair §1: the host never touches the DB; the API container seeds
+        # the admin client from KB_ADMIN_TOKEN at startup. This path exists
+        # for direct (non-Compose) deployments where the CLI process IS on
+        # the same network as PostgreSQL.
+        env_token = _load_env().get("KB_ADMIN_TOKEN") or None
+        repos = Repositories(cp)
+        token = await repos.clients.ensure_admin_client(token=env_token)
+        if token:
+            print(f"admin client '{ADMIN_CLIENT_ID}' seeded (credential: KB_ADMIN_TOKEN from .env)")
+        else:
+            print(f"admin client '{ADMIN_CLIENT_ID}' already present — left unchanged")
+    elif not dev_token:  # --migrate-only skips client seeding
         print("control plane ready:", settings.database_url)
         print("namespaces:", settings.namespace_list)
     await cp.dispose()
@@ -748,6 +854,8 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("status", help="Stack + knowledge + queue overview")
     p_doc = sub.add_parser("doctor", help="Deep health diagnostics")
     p_doc.add_argument("--verbose", action="store_true")
+    p_doc.add_argument("--strict", action="store_true",
+                       help="treat optional-provisioning warnings (tunnel, backup, LLM) as failures")
     sub.add_parser("backup", help="Verified backup of postgres + falkordb")
     p_res = sub.add_parser("restore", help="Restore a backup (checksums verified first)")
     p_res.add_argument("path")
@@ -770,7 +878,14 @@ def main(argv: list[str] | None = None) -> None:
 
     p_conn = sub.add_parser("connect", help="Create a client + print its MCP config")
     p_conn.add_argument("target", choices=["claude-code", "cursor", "generic"])
-    p_conn.add_argument("--name", default=None)
+    p_conn.add_argument("--name", default=None,
+                        help="client identifier (defaults from the target: claude-code/cursor/mcp-client)")
+    p_conn.add_argument("--rotate", action="store_true",
+                        help="EXPLICITLY rotate the credential if the client already exists")
+    p_conn.add_argument("--write", action="store_true",
+                        help="(cursor) merge the config into mcp.json instead of only printing it")
+    p_conn.add_argument("--path", default=None,
+                        help="(cursor with --write) mcp.json path (default ~/.cursor/mcp.json)")
 
     p_disc = sub.add_parser("disconnect", help="Revoke a client's credential")
     p_disc.add_argument("client_name")
@@ -783,6 +898,9 @@ def main(argv: list[str] | None = None) -> None:
     p_boot = sub.add_parser("bootstrap", help="Create control-plane tables")
     p_boot.add_argument("--migrate-only", action="store_true",
                         help="Run migrations and exit (used by compose 'migrate' service)")
+    p_boot.add_argument("--seed-admin", action="store_true",
+                        help="Also ensure the kb-admin client exists (direct deployments; "
+                             "the Compose API container does this automatically at startup)")
     sub.add_parser("worker", help="Run the ingestion worker")
     p_client = sub.add_parser("register-client", help="Register an integrating client")
     p_client.add_argument("client_id")
@@ -825,7 +943,8 @@ def main(argv: list[str] | None = None) -> None:
         asyncio.run(_cmd_disconnect(args))
     elif args.command == "bootstrap":
         settings = get_settings()
-        asyncio.run(_bootstrap(settings, None if args.migrate_only else "skip-dev-token"))
+        asyncio.run(_bootstrap(settings, None if args.migrate_only else "skip-dev-token",
+                               seed_admin=args.seed_admin))
     elif args.command == "register-client":
         asyncio.run(_register_client(args))
     elif args.command == "worker":
