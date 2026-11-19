@@ -30,11 +30,18 @@ from ecosystem_kb.adapters.graphiti.health import check_graph
 from ecosystem_kb.adapters.postgres.repositories import ControlPlane, Repositories
 from ecosystem_kb.core.config import get_settings
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-COMPOSE_LOCAL = REPO_ROOT / "deploy" / "compose.local.yaml"
-ENV_PATH = REPO_ROOT / ".env"
-ENV_EXAMPLE = REPO_ROOT / ".env.example"
-BACKUP_ROOT = REPO_ROOT / "backups"
+# Deployment state belongs to the DIRECTORY THE OWNER RUNS `kb` FROM (the
+# deployment checkout), never to the installed package's source tree.
+# Repair finding: deriving these from __file__ silently wrote .env into
+# site-packages on non-editable installs — or into the source tree when
+# running from elsewhere — so neither the stack nor the CLI saw the same
+# configuration.
+DEPLOY_ROOT = Path.cwd()
+COMPOSE_LOCAL = DEPLOY_ROOT / "deploy" / "compose.local.yaml"
+ENV_PATH = DEPLOY_ROOT / ".env"
+ENV_EXAMPLE = DEPLOY_ROOT / ".env.example"
+BACKUP_ROOT = DEPLOY_ROOT / "backups"
+REPO_ROOT = Path(__file__).resolve().parents[3]  # installed source tree
 
 ADMIN_CLIENT_ID = "kb-admin"
 
@@ -47,7 +54,7 @@ ADMIN_CLIENT_ID = "kb-admin"
 def _compose(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     """Run docker compose against the local profile from the repo root."""
     cmd = ["docker", "compose", "-f", str(COMPOSE_LOCAL), *args]
-    return subprocess.run(cmd, cwd=REPO_ROOT, check=check)
+    return subprocess.run(cmd, cwd=DEPLOY_ROOT, check=check)
 
 
 def _compose_profile(*args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -55,7 +62,8 @@ def _compose_profile(*args: str, check: bool = True) -> subprocess.CompletedProc
 
 
 def _load_env() -> dict[str, str]:
-    """Minimal .env parser (no dependency on dotenv)."""
+    """Deployment .env values, with real environment variables taking
+    precedence (CI and tests override without rewriting files)."""
     values: dict[str, str] = {}
     if ENV_PATH.exists():
         for line in ENV_PATH.read_text().splitlines():
@@ -64,6 +72,7 @@ def _load_env() -> dict[str, str]:
                 continue
             k, _, v = line.partition("=")
             values[k.strip()] = v.strip()
+    values.update({k: v for k, v in os.environ.items() if k.startswith(("KB_", "CF_"))})
     return values
 
 
@@ -221,24 +230,12 @@ def _cmd_nuke(args) -> None:
 # --------------------------------------------------------------------------
 
 
-async def _api_json(path: str) -> dict | None:
-    import httpx
-
-    env = _load_env()
-    base = env.get("KB_LOCAL_URL", "http://127.0.0.1:8000")
-    try:
-        r = await httpx.AsyncClient(timeout=5).get(f"{base}{path}")
-        return r.json() if r.status_code == 200 else None
-    except Exception:
-        return None
-
-
 def _container_states() -> dict[str, str]:
     """service -> health from `docker compose ps --format json`."""
     try:
         out = subprocess.run(
             ["docker", "compose", "-f", str(COMPOSE_LOCAL), "ps", "-a", "--format", "json"],
-            cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+            cwd=DEPLOY_ROOT, capture_output=True, text=True, check=True,
         ).stdout.strip()
     except Exception:
         return {}
@@ -585,9 +582,9 @@ async def _cmd_connect(args) -> None:
         )
         print(snippet)
 
-    instructions = REPO_ROOT / "docs" / "clients" / "AGENT-INSTRUCTIONS.md"
+    instructions = DEPLOY_ROOT / "docs" / "clients" / "AGENT-INSTRUCTIONS.md"
     if not instructions.exists():
-        (REPO_ROOT / "docs" / "clients").mkdir(parents=True, exist_ok=True)
+        (DEPLOY_ROOT / "docs" / "clients").mkdir(parents=True, exist_ok=True)
         instructions.write_text(CLIENT_SNIPPET)
         print("\nusage instructions written to docs/clients/AGENT-INSTRUCTIONS.md")
 
@@ -626,7 +623,7 @@ def _cmd_tunnel(args) -> None:
 def _psql_docker(*parts: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_LOCAL), "exec", "-T", "postgres", *parts],
-        cwd=REPO_ROOT, capture_output=True, text=True, check=check,
+        cwd=DEPLOY_ROOT, capture_output=True, text=True, check=check,
     )
 
 
@@ -648,7 +645,7 @@ def _cmd_backup(args) -> None:
     r = subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_LOCAL), "exec", "-T", "postgres",
          "pg_dump", "-U", "kb", "-d", "ecosystem_kb"],
-        cwd=REPO_ROOT, capture_output=True,
+        cwd=DEPLOY_ROOT, capture_output=True,
     )
     if r.returncode != 0 or not r.stdout:
         sys.exit(f"pg_dump FAILED — no backup written. {r.stderr.decode()[:300]}")
@@ -658,21 +655,21 @@ def _cmd_backup(args) -> None:
     r = subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_LOCAL), "exec", "-T", "falkordb",
          "redis-cli", "-a", _load_env().get("FALKORDB_PASSWORD", ""), "--no-auth-warning", "SAVE"],
-        cwd=REPO_ROOT, capture_output=True, text=True,
+        cwd=DEPLOY_ROOT, capture_output=True, text=True,
     )
     if "OK" not in r.stdout:
         sys.exit(f"FalkorDB SAVE FAILED — no backup written. {r.stdout[:200]} {r.stderr[:200]}")
     rdb_tmp = tmp / "falkordb.rdb"
     rc = subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_LOCAL), "cp", "falkordb:/data/dump.rdb", str(rdb_tmp)],
-        cwd=REPO_ROOT, capture_output=True,
+        cwd=DEPLOY_ROOT, capture_output=True,
     )
     if rc.returncode != 0 or not rdb_tmp.exists() or rdb_tmp.stat().st_size == 0:
         sys.exit(f"FalkorDB RDB copy FAILED — no backup written. {rc.stderr.decode()[:300]}")
 
     # 3. Manifest with checksums (app version from pyproject).
     version = "unknown"
-    pyproject = REPO_ROOT / "pyproject.toml"
+    pyproject = DEPLOY_ROOT / "pyproject.toml"
     if pyproject.exists():
         for line in pyproject.read_text().splitlines():
             if line.startswith("version"):
@@ -734,22 +731,22 @@ def _cmd_restore(args) -> None:
     print("checksums verified; restoring into live volumes…")
     _compose_profile("down")
     # Postgres: recreate volume, boot postgres only, restore dump.
-    subprocess.run(["docker", "volume", "rm", "ecosystem-kb_postgres_data"], cwd=REPO_ROOT, check=True)
+    subprocess.run(["docker", "volume", "rm", "ecosystem-kb_postgres_data"], cwd=DEPLOY_ROOT, check=True)
     _compose("up", "-d", "--wait", "postgres")
     r = subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_LOCAL), "exec", "-T", "postgres",
          "psql", "-U", "kb", "-d", "ecosystem_kb", "-v", "ON_ERROR_STOP=1"],
-        cwd=REPO_ROOT, input=(src / "control_plane.sql").read_text(),
+        cwd=DEPLOY_ROOT, input=(src / "control_plane.sql").read_text(),
         capture_output=True, text=True,
     )
     if r.returncode != 0:
         sys.exit(f"psql restore FAILED: {r.stderr[:400]}")
     # FalkorDB: copy RDB into the data volume, restart to load it.
-    subprocess.run(["docker", "volume", "rm", "ecosystem-kb_falkordb_data"], cwd=REPO_ROOT, check=True)
+    subprocess.run(["docker", "volume", "rm", "ecosystem-kb_falkordb_data"], cwd=DEPLOY_ROOT, check=True)
     _compose("up", "-d", "--wait", "falkordb")
     subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_LOCAL), "cp", str(src / "falkordb.rdb"), "falkordb:/data/dump.rdb"],
-        cwd=REPO_ROOT, check=True,
+        cwd=DEPLOY_ROOT, check=True,
     )
     _compose("restart", "falkordb")
     _compose("up", "-d", "--wait")
