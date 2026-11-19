@@ -146,10 +146,12 @@ async def _consent_or_redirect(request: Request, oauth, client, request_id, sess
 async def authorize_decide(request: Request):
     """Owner decision on the consent screen. Session-authenticated with
     Origin checking (the browser form posts here)."""
+    from ecosystem_kb.api.routes.auth import _origin_allowed
+
     origin = request.headers.get("origin")
     settings = request.app.state.settings
     base = (settings.public_base_url or "").rstrip("/")
-    if base and origin is not None and origin != base:
+    if not _origin_allowed(origin, base):
         return JSONResponse({"error": "invalid_origin"}, status_code=403)
     token = request.cookies.get("kb_session")
     session_row = await request.app.state.oauth_sessions.resolve(token) if token else None

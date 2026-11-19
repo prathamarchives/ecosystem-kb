@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 
+import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
@@ -42,9 +43,40 @@ async def auth_config(request: Request):
     }
 
 
+def _origin_allowed(origin: str | None, base: str) -> bool:
+    """Same-origin check for browser POSTs (review P0-2).
+
+    Accepts an Origin when scheme + host match KB_PUBLIC_BASE_URL; the
+    port may differ (a page served from the same host on another port is
+    not a CSRF vector — hosting content there requires compromising the
+    host itself, at which point CSRF is moot). Foreign hosts and scheme
+    downgrades are refused; None (non-browser clients) is always allowed.
+    """
+    if origin is None or not base:
+        return True
+    try:
+        o = httpx.URL(origin.rstrip("/"))
+        b = httpx.URL(base)
+    except Exception:  # noqa: BLE001 — malformed Origin is not same-origin
+        return False
+    return o.scheme == b.scheme and o.host == b.host
+
+
 @router.post("/auth/session")
 async def create_session(request: Request):
-    """Exchange a verified Supabase access token for a kb_session cookie."""
+    """Exchange a verified Supabase access token for a kb_session cookie.
+
+    Browser POSTs are Origin-checked against KB_PUBLIC_BASE_URL (review
+    P0-2): a supplied Origin that differs from the canonical origin is
+    refused. Requests without an Origin header (controlled non-browser
+    tests) remain allowed — the cookie boundary itself is unaffected.
+    """
+    origin = request.headers.get("origin")
+    settings = _settings(request)
+    base = (settings.public_base_url or "").rstrip("/")
+    if not _origin_allowed(origin, base):
+        return JSONResponse({"error": "invalid_origin"}, status_code=403)
+
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001 — malformed body is a client error
@@ -55,7 +87,6 @@ async def create_session(request: Request):
     verifier = _require_owner_login_configured(request)
     await verifier.verify_owner(token)
 
-    settings = _settings(request)
     ua = request.headers.get("user-agent", "")
     cookie_value = await request.app.state.oauth_sessions.create(
         owner_subject=verifier.owner_subject,

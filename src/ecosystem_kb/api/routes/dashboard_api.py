@@ -16,13 +16,17 @@ router = APIRouter(tags=["dashboard-api"])
 
 
 def _check_origin(request: Request) -> None:
-    """Same-origin enforcement for cookie-authenticated state changes."""
+    """Same-origin enforcement for cookie-authenticated state changes.
+    Shares the scheme+host rule with /auth/session (see routes/auth.py):
+    port may differ, foreign hosts never pass."""
+    from ecosystem_kb.api.routes.auth import _origin_allowed
+
     origin = request.headers.get("origin")
     if origin is None:
         return  # non-browser clients (curl) have no Origin; cookie required anyway
     settings = request.app.state.settings
     base = (settings.public_base_url or "").rstrip("/")
-    if base and origin != base:
+    if not _origin_allowed(origin, base):
         raise AuthenticationError("cross-origin request refused")
 
 

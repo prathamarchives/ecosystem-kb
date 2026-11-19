@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import re
 import secrets
 
@@ -124,7 +125,11 @@ async def _full_flow(client, app, scope="kb:read kb:write offline_access"):
             },
         )
         assert r.status_code == 200, r.text[:200]
-        request_id = re.search(r"window\.KB_PENDING_AUTH = '([^']+)'", r.text).group(1)
+        config = json.loads(
+            re.search(r"var KB_CONFIG = (\{.*?\});", r.text, re.S).group(1)
+        )
+        request_id = config["pending_request"]
+        assert request_id, "login page must carry the pending request"
         cookie = await _owner_session(app)
         c.cookies.set("kb_session", cookie)
         r = await c.get("/oauth/authorize/resume", params={"request_id": request_id})
@@ -356,7 +361,11 @@ class TestAuthorization:
                 "resource": RESOURCE,
             },
         )
-        request_id = re.search(r"window\.KB_PENDING_AUTH = '([^']+)'", r.text).group(1)
+        config = json.loads(
+            re.search(r"var KB_CONFIG = (\{.*?\});", r.text, re.S).group(1)
+        )
+        request_id = config["pending_request"]
+        assert request_id, "login page must carry the pending request"
         cookie = await _owner_session(app)
         c.cookies.set("kb_session", cookie)
         r = await c.get("/oauth/authorize/resume", params={"request_id": request_id})
@@ -401,7 +410,11 @@ class TestTokenEndpoint:
                 "resource": RESOURCE,
             },
         )
-        request_id = re.search(r"window\.KB_PENDING_AUTH = '([^']+)'", r.text).group(1)
+        config = json.loads(
+            re.search(r"var KB_CONFIG = (\{.*?\});", r.text, re.S).group(1)
+        )
+        request_id = config["pending_request"]
+        assert request_id, "login page must carry the pending request"
         cookie = await _owner_session(app)
         c.cookies.set("kb_session", cookie)
         r = await c.get("/oauth/authorize/resume", params={"request_id": request_id})

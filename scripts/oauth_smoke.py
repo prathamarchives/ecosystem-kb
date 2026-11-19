@@ -139,10 +139,11 @@ def main() -> int:
             follow_redirects=False,
         )
         check("authorize shows login", r.status_code == 200, r.status_code)
+        import json as _json
         import re
 
-        m = re.search(r"window\.KB_PENDING_AUTH = '([^']+)'", r.text)
-        request_id = m.group(1) if m else None
+        m = re.search(r"var KB_CONFIG = (\{.*?\});", r.text, re.S)
+        request_id = _json.loads(m.group(1))["pending_request"] if m else None
         check("login page carries pending request_id", request_id is not None)
 
         # pending survives (JSON status endpoint)

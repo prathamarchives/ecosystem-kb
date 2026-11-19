@@ -1,18 +1,28 @@
 """Dashboard routes (runbook Step 9): one origin, one static page.
 
 FastAPI serves the whole owner UI. No second hostname, no UI container.
-Untrusted values (client names, facts, errors) are rendered with
-textContent only — never interpolated into HTML strings.
+Security model (review P0-1/P0-2):
+  - CSP with a per-response cryptographically random nonce on the single
+    inline script; 'unsafe-inline' is never used; Cache-Control: no-store
+    because the HTML carries a per-response nonce + owner/login state.
+  - Values embedded into JavaScript are serialized with json.dumps,
+    never Python repr.
+  - Untrusted values (client names, facts, errors) are rendered with
+    textContent/DOM construction only.
+  - Owner login is the Supabase PKCE browser flow: Web Crypto verifier,
+    localStorage persistence, /auth/v1/otp?redirect_to=..., callback code
+    exchange at /auth/v1/token?grant_type=pkce, then the same-origin
+    /auth/session exchange for the first-party kb_session cookie.
 """
 
 from __future__ import annotations
 
 import html
+import json
+import secrets
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
-
-from ecosystem_kb.core.exceptions import AuthenticationError
 
 router = APIRouter(tags=["dashboard"])
 
@@ -135,10 +145,34 @@ pre.snippet { background:#10131a; border:1px solid var(--line); border-radius:8p
 </main>
 <div id="toast"></div>
 
-<script>
+<script nonce="__NONCE__">
 "use strict";
 // Every untrusted value is rendered with textContent/DOM construction.
-// innerHTML is never used for data. CSP is set by the server.
+// innerHTML is never used for data. CSP allows only this nonce-tagged
+// script plus same-origin resources.
+
+// ---- PKCE helpers (Web Crypto; no plain fallback — review P0-2) ----
+function b64url(bytes) {
+  let s = "";
+  const arr = new Uint8Array(bytes);
+  for (let i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
+  return btoa(s).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, "");
+}
+
+async function createPkce() {
+  if (!window.crypto || !window.crypto.subtle || !window.crypto.getRandomValues) {
+    throw new Error("Web Crypto is unavailable in this browser; cannot sign in securely.");
+  }
+  const raw = new Uint8Array(32);
+  window.crypto.getRandomValues(raw);
+  const verifier = b64url(raw); // 43 chars for 32 bytes
+  const digest = await window.crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  const challenge = b64url(digest);
+  return { verifier, challenge };
+}
+
+// ---- configuration injected by the server (json.dumps, never repr) ----
+var KB_CONFIG = __KB_CONFIG__;
 
 function el(tag, attrs, children) {
   const node = document.createElement(tag);
@@ -165,8 +199,8 @@ async function api(path, opts) {
   return data;
 }
 
-// ---- login ----
-function showLogin() {
+// ---- login: Supabase magic-link PKCE (review P0-2) ----
+function showLogin(pendingRequestId) {
   const main = document.querySelector("main");
   main.textContent = "";
   const card = el("div", { class: "card", id: "login-card" });
@@ -179,13 +213,31 @@ function showLogin() {
     err.textContent = "";
     try {
       const cfg = await api("/auth/config");
-      await fetch(cfg.supabase_url + "/auth/v1/otp", {
+      const pkce = await createPkce();
+      // Persist BEFORE sending: the email link may open in a new tab.
+      window.localStorage.setItem("kb_pkce_verifier", pkce.verifier);
+      if (pendingRequestId) window.localStorage.setItem("kb_pending_request", pendingRequestId);
+      else window.localStorage.removeItem("kb_pending_request");
+
+      const callback = new URL(cfg.callback_url);
+      if (pendingRequestId) callback.searchParams.set("request_id", pendingRequestId);
+      const otpUrl = new URL(cfg.supabase_url + "/auth/v1/otp");
+      otpUrl.searchParams.set("redirect_to", callback.toString());
+
+      const r = await fetch(otpUrl.toString(), {
         method: "POST",
         headers: { "Content-Type": "application/json", "apikey": cfg.supabase_anon_key },
-        body: JSON.stringify({ email: email.value, create_user: false,
-          email_redirect_to: cfg.callback_url }),
-      }).then(async r => { if (!r.ok) throw new Error("Supabase rejected the request"); });
-      err.textContent = "";
+        body: JSON.stringify({
+          email: email.value,
+          create_user: false,
+          code_challenge: pkce.challenge,
+          code_challenge_method: "s256",
+        }),
+      });
+      if (!r.ok) {
+        const detail = await r.json().catch(() => ({}));
+        throw new Error(detail.msg || detail.error_description || detail.message || ("Supabase returned HTTP " + r.status));
+      }
       toast("Sign-in link sent — check your email.");
     } catch (e) { err.textContent = e.message; }
   });
@@ -195,9 +247,9 @@ function showLogin() {
 
 function showApp() {
   document.getElementById("logout").classList.remove("hidden");
-  document.getElementById("endpoint").textContent = window.KB_MCP_URL;
+  document.getElementById("endpoint").textContent = KB_CONFIG.mcp_url;
   document.getElementById("connect-json").textContent =
-    JSON.stringify({ mcpServers: { "ecosystem-kb": { url: window.KB_MCP_URL } } }, null, 2);
+    JSON.stringify({ mcpServers: { "ecosystem-kb": { url: KB_CONFIG.mcp_url } } }, null, 2);
   loadClients(); loadStatus();
 }
 
@@ -226,7 +278,7 @@ async function doSearch() {
       card.appendChild(el("div", { text: fact.fact || "" }));
       const meta = el("div", { class: "muted", style: "font-size:13px;margin-top:6px" });
       const status = fact.epistemic_status || "unknown";
-      meta.appendChild(el("span", { class: "tag " + (status === "accepted" ? "ok" : status === "superseded" ? "warn" : "warn"), text: status }));
+      meta.appendChild(el("span", { class: "tag " + (status === "accepted" ? "ok" : "warn"), text: status }));
       if (fact.source_reference) meta.appendChild(el("span", { class: "tag", text: fact.source_reference }));
       if (fact.valid_at) meta.appendChild(el("span", { class: "tag", text: "from " + fact.valid_at }));
       card.appendChild(meta);
@@ -327,57 +379,169 @@ async function loadStatus() {
 (async function boot() {
   try {
     const me = await api("/auth/me");
-    if (!me.authenticated) { showLogin(); return; }
+    if (!me.authenticated) { showLogin(KB_CONFIG.pending_request); return; }
     document.getElementById("whoami").textContent = "owner";
     showApp();
-  } catch (e) { showLogin(); }
+  } catch (e) { showLogin(KB_CONFIG.pending_request); }
 })();
 </script>
 </body>
 </html>"""
 
 
-def _page(extra_js: str = "", body_class: str = "") -> HTMLResponse:
-    script = f"window.KB_MCP_URL = {extra_js};" if extra_js else ""
-    page = _PAGE.replace("<script>\n\"use strict\";", f"<script>\n\"use strict\";\n{script}")
+def _page(config: dict) -> HTMLResponse:
+    """Render the dashboard shell.
+
+    config: JSON-serializable values the client script needs (mcp_url,
+    pending_request). Serialized with json.dumps — never repr. A fresh
+    cryptographically random nonce is generated per response and applied
+    to both the script element and the CSP header.
+    """
+    nonce = secrets.token_urlsafe(18)
+    page = _PAGE.replace("__NONCE__", nonce)
+    page = page.replace("__KB_CONFIG__", json.dumps(config))
     response = HTMLResponse(page)
     response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; "
+        "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+        f"script-src 'self' 'nonce-{nonce}'; "
         "connect-src 'self' https://*.supabase.co; img-src 'self' data:; "
         "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
     )
+    response.headers["Cache-Control"] = "no-store"  # per-response nonce + login state
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
     return response
 
 
-async def _require_owner(request: Request):
-    """Owner session or raise. Used by every dashboard data endpoint."""
-    token = request.cookies.get("kb_session")
-    if not token:
-        raise AuthenticationError("owner login required")
-    row = await request.app.state.oauth_sessions.resolve(token)
-    if row is None:
-        raise AuthenticationError("owner login required")
-    return row
-
-
 @router.get("/", include_in_schema=False)
 async def dashboard(request: Request):
     settings = request.app.state.settings
-    resource = settings.canonical_mcp_resource or ""
-    return _page(extra_js=f'"{resource}"')
+    return _page({"mcp_url": settings.canonical_mcp_resource or "", "pending_request": None})
 
 
 def login_page(request: Request, next_request_id: str | None = None) -> HTMLResponse:
-    """Login view with a pending OAuth authorization to resume after login."""
-    resume = (
-        f"window.KB_PENDING_AUTH = {next_request_id!r};"
-        if next_request_id
-        else "window.KB_PENDING_AUTH = null;"
+    """Login view; carries the pending OAuth request id (if any) for the
+    PKCE callback to resume."""
+    return _page({"mcp_url": "", "pending_request": next_request_id})
+
+
+_CALLBACK_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Completing sign-in…</title>
+<style>
+body { margin:0; font:15px/1.5 system-ui,sans-serif; background:#0f1115; color:#e6e9ef;
+  display:flex; align-items:center; justify-content:center; min-height:100vh; }
+.card { background:#171a21; border:1px solid #2a2f3a; border-radius:12px; padding:28px; max-width:460px; width:92%; }
+h1 { font-size:18px; margin:0 0 8px; }
+.muted { color:#8b93a3; }
+.err { color:#f85149; margin-top:10px; min-height:20px; }
+a { color:#4f8cff; }
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Completing sign-in…</h1>
+<p id="status" class="muted">Exchanging the sign-in code.</p>
+<p class="err" id="err"></p>
+<p><a href="/" id="retry" style="display:none">Start a fresh sign-in</a></p>
+</div>
+<script nonce="__NONCE__">
+"use strict";
+// Supabase magic-link PKCE completion (review P0-2):
+//   1. read code + request_id from the query
+//   2. verify request_id matches the localStorage value (anti-substitution)
+//   3. exchange the code at /auth/v1/token?grant_type=pkce
+//   4. POST the access token to same-origin /auth/session (HttpOnly cookie)
+//   5. clear storage, replace history, resume the pending OAuth request
+
+function fail(msg) {
+  document.getElementById("status").textContent = "Sign-in failed.";
+  const err = document.getElementById("err");
+  err.textContent = msg || "Unknown error.";
+  document.getElementById("retry").style.display = "inline";
+}
+
+async function run() {
+  const params = new URLSearchParams(window.location.search);
+  const code = params.get("code");
+  const request_id = params.get("request_id");
+  const storedVerifier = window.localStorage.getItem("kb_pkce_verifier");
+  const storedRequest = window.localStorage.getItem("kb_pending_request");
+
+  if (!code) { fail("No sign-in code in the URL."); return; }
+  // The request_id must match what was stored when the link was requested:
+  // never resume a different pending authorization.
+  if (request_id && storedRequest && request_id !== storedRequest) {
+    fail("Sign-in session mismatch — start again from the application.");
+    return;
+  }
+  const verifier = storedVerifier;
+  window.localStorage.removeItem("kb_pkce_verifier");
+  // Remove the one-time code from history immediately.
+  window.history.replaceState({}, "", "/auth/callback");
+
+  if (!verifier) { fail("Sign-in verifier missing — request a new link."); return; }
+
+  try {
+    const cfg = await fetch("/auth/config", { credentials: "same-origin" }).then(r => r.json());
+    const tokenUrl = cfg.supabase_url + "/auth/v1/token?grant_type=pkce";
+    const r = await fetch(tokenUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "apikey": cfg.supabase_anon_key },
+      body: JSON.stringify({ auth_code: code, code_verifier: verifier }),
+    });
+    if (!r.ok) {
+      const detail = await r.json().catch(() => ({}));
+      throw new Error(detail.msg || detail.error_description || detail.message || ("token exchange HTTP " + r.status));
+    }
+    const session = await r.json();
+    if (!session.access_token) throw new Error("Supabase returned no access token.");
+
+    const me = await fetch("/auth/session", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ access_token: session.access_token }),
+    });
+    if (!me.ok) {
+      const detail = await me.json().catch(() => ({}));
+      throw new Error(detail.message || ("session exchange HTTP " + me.status));
+    }
+
+    const pending = request_id || null;
+    window.localStorage.removeItem("kb_pending_request");
+    document.getElementById("status").textContent = "Signed in. Continuing…";
+    window.location.replace(pending ? "/oauth/authorize/resume?request_id=" + encodeURIComponent(pending) : "/");
+  } catch (e) {
+    fail(e.message);
+  }
+}
+
+run();
+</script>
+</body>
+</html>"""
+
+
+def callback_page(request: Request) -> HTMLResponse:
+    """Executable callback HTML: performs the PKCE code exchange, the
+    same-origin session exchange, then resumes the pending authorization."""
+    nonce = secrets.token_urlsafe(18)
+    page = _CALLBACK_PAGE.replace("__NONCE__", nonce)
+    response = HTMLResponse(page)
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; style-src 'unsafe-inline'; "
+        f"script-src 'self' 'nonce-{nonce}'; "
+        "connect-src 'self' https://*.supabase.co; frame-ancestors 'none'"
     )
-    response = _page(extra_js=resume)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
     return response
 
 
@@ -431,17 +595,17 @@ button {{ flex:1; padding:11px; border-radius:8px; border:0; cursor:pointer; fon
 </form>
 </div></body></html>"""
     response = HTMLResponse(page)
-    response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'unsafe-inline'; script-src 'none'; frame-ancestors 'none'"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; style-src 'unsafe-inline'; script-src 'none'; frame-ancestors 'none'"
+    )
+    response.headers["Cache-Control"] = "no-store"
     response.headers["X-Frame-Options"] = "DENY"
     return response
 
 
 @router.get("/auth/callback", include_in_schema=False)
-async def auth_callback():
-    """The Supabase PKCE callback lands here; the SPA script on / handles
-    the code exchange client-side, so this is a redirect to / with the
-    query preserved."""
-    return HTMLResponse(
-        '<!doctype html><meta http-equiv="refresh" content="0;url=/">'
-        "<p>Completing sign-in…</p>"
-    )
+async def auth_callback(request: Request):
+    """The Supabase PKCE callback lands here. The page itself performs the
+    code exchange + session exchange (client-side, with the anon key only)
+    and then resumes any pending OAuth authorization."""
+    return callback_page(request)
