@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
 
 _REDIS_SERVER_CANDIDATES = [
     Path.home() / ".venv/bin/redis-server",
-    shutil.which("redis-server") or "",
 ]
 
 _MODULE_CANDIDATES = [
@@ -24,10 +24,28 @@ _MODULE_CANDIDATES = [
 ]
 
 
+def _redislite_bin() -> Path | None:
+    """Locate the redislite package directory robustly: import beats
+    hardcoded venv paths (GitHub runners use /opt/hostedtoolcache, uv uses
+    ~/.local/share/uv, etc.)."""
+    try:
+        import redislite
+
+        return Path(redislite.__file__).resolve().parent / "bin"
+    except Exception:
+        return None
+
+
 def _find_redis_server() -> str:
     for cand in _REDIS_SERVER_CANDIDATES:
         if cand and Path(cand).exists():
             return str(cand)
+    rl_bin = _redislite_bin()
+    if rl_bin is not None and (rl_bin / "redis-server").exists():
+        return str(rl_bin / "redis-server")
+    found = shutil.which("redis-server")
+    if found:
+        return found
     raise RuntimeError(
         "redis-server not found; install the 'embedded' extra (pip install "
         "'ecosystem-kb[embedded]') or point tests at a live FalkorDB"
@@ -38,9 +56,14 @@ def _find_falkor_module() -> str:
     for cand in _MODULE_CANDIDATES:
         if cand.exists():
             return str(cand)
-    # fall back to searching site-packages
-    for base in (Path.home() / ".venv/lib").glob("python*/site-packages/redislite/bin/falkordb.so"):
-        return str(base)
+    rl_bin = _redislite_bin()
+    if rl_bin is not None and (rl_bin / "falkordb.so").exists():
+        return str(rl_bin / "falkordb.so")
+    # fall back to searching sys.path site-packages
+    for entry in sys.path:
+        cand = Path(entry) / "redislite" / "bin" / "falkordb.so"
+        if cand.exists():
+            return str(cand)
     raise RuntimeError("falkordb.so not found; install falkordblite")
 
 
