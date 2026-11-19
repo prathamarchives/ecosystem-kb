@@ -25,6 +25,7 @@ async def api(embedded_graph, tmp_path):
         default_namespace="ecosystem-dev",
         allowed_namespaces="ecosystem-dev,ecosystem-test,ecosystem-prod",
         api_tokens="test-admin-token",
+        allow_static_tokens=True,
     )
     cp = ControlPlane(settings.database_url)
     await cp.create_all()

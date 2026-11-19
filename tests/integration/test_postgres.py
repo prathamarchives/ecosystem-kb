@@ -85,8 +85,9 @@ class TestMigrationsOnPostgres:
             rows = (await conn.execute(
                 text("SELECT version FROM kb_schema_migrations ORDER BY version")
             )).scalars()
-        assert list(rows) == [1, 2]
-        assert latest_version() == 2
+        expected = [m.version for m in load_migrations()]
+        assert list(rows) == expected
+        assert latest_version() == expected[-1]
 
     async def test_orm_columns_match_migrations(self, pg_engine):
         """Schema parity: every ORM column exists in the migrated database."""

@@ -60,14 +60,44 @@ async def kb_capture(
     source_uri: str | None = None,
     status: str = "proposed",
     tags: list[str] | None = None,
+    extraction: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Durable capture from plain fields. Returns the event receipt."""
+    """Durable capture from plain fields. Returns the event receipt.
+
+    `extraction` (runbook Step 10): optional typed entities/edges payload.
+    Validated here against the controlled ontology and again in the worker;
+    a violation is REJECTED (never silently quarantined) so the caller can
+    fix it. Without extraction the event lands with an honest
+    'extraction unavailable' status under a fake/inactive provider.
+    """
     if kind not in CAPTURE_KINDS:
         raise ValueError(
             f"unknown kind {kind!r}; choose one of: {', '.join(sorted(CAPTURE_KINDS))}"
         )
     if status not in STATUS_VALUES:
         raise ValueError(f"status must be one of: {', '.join(sorted(STATUS_VALUES))}")
+
+    extraction_status = "not_requested"
+    extraction_payload = None
+    if extraction is not None:
+        from ecosystem_kb.services.extraction import parse_extraction
+
+        parsed, error = parse_extraction(extraction)
+        if error is not None or parsed is None:
+            from ecosystem_kb.core.exceptions import ValidationError
+
+            raise ValidationError(error or "extraction payload invalid")
+        ontology_errors = parsed.validate_ontology()
+        if ontology_errors:
+            from ecosystem_kb.core.exceptions import ValidationError
+
+            raise ValidationError(
+                "extraction violates the controlled ontology: " + "; ".join(ontology_errors[:5])
+            )
+        extraction_payload = parsed.model_dump(mode="json")
+        extraction_status = "validated"
+    elif services.settings.llm_provider == "fake":
+        extraction_status = "unavailable_fake_provider"
 
     source_id = f"system:mcp:{client.client_id}"
     # Auto-register the client's own source so the ownership boundary
@@ -118,7 +148,14 @@ async def kb_capture(
         classification=EventClassification(
             trust_class="agent_reported", review_status="unreviewed"
         ),
-        content=EventContent(content_type="text", body=body),
+        content=EventContent(
+            content_type="text",
+            body=(
+                _extraction_body(title, content, project, repository, extraction_payload)
+                if extraction_payload
+                else body
+            ),
+        ),
         payload={
             "capture_kind": kind,
             "title": title,
@@ -127,17 +164,43 @@ async def kb_capture(
             "status": status,
             "tags": tags or [],
             "captured_by": client.client_id,
+            "extraction": extraction_payload,
+            "extraction_status": extraction_status,
         },
     )
     receipt = await services.submit_event(client, event)
     out = receipt.model_dump(mode="json")
     out["kind"] = kind
     out["title"] = title
+    out["extraction_status"] = extraction_status
     out["epistemic_note"] = (
         "captured as unreviewed agent-reported knowledge; it is not canonical "
         "truth until reviewed (LAW-003)"
     )
+    if extraction_status == "unavailable_fake_provider":
+        out["extraction_status"] = (
+            "capture saved; extraction unavailable (no real inference provider configured)"
+        )
     return out
+
+
+def _extraction_body(
+    title: str, content: str, project: str | None, repository: str | None, extraction: dict
+) -> str:
+    """Episode body for typed captures: plain content PLUS the rendered
+    typed extraction, so the SAME ingestion pipeline writes both."""
+    from ecosystem_kb.services.extraction import (
+        TypedExtraction,
+        extraction_episode_body,
+    )
+
+    rendered = extraction_episode_body(TypedExtraction(**extraction), title)
+    parts = [rendered, "", content]
+    if project:
+        parts.append(f"[project:{project}]")
+    if repository:
+        parts.append(f"[repository:{repository}]")
+    return "\n".join(parts)
 
 
 async def kb_context(

@@ -26,7 +26,9 @@ async def _aresolve(request) -> tuple:
     The mounted MCP sub-app REPLACES scope["app"] with itself (Starlette
     semantics), so the FastAPI parent is not reachable through the scope.
     create_app() mirrors the service wiring onto the sub-app's own state at
-    startup; resolve through that.
+    startup; resolve through that. authenticate_token resolves KB OAuth
+    access tokens first (runbook Step 8), then legacy static tokens only
+    while the migration flag allows.
     """
     from ecosystem_kb.core.exceptions import AuthenticationError
 
@@ -123,6 +125,7 @@ async def kb_capture(
     source_uri: str | None = None,
     status: str = "proposed",
     tags: list[str] | None = None,
+    extraction: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Capture durable knowledge — decisions, findings, corrections, resolved problems.
 
@@ -136,10 +139,22 @@ async def kb_capture(
     repository, source_uri (commit/PR/URL backing this), status
     (proposed|accepted|superseded|rejected|disputed), tags.
 
-    WHAT YOU GET: a receipt with the event id and processing status. The
-    item is recorded as UNREVIEWED agent-reported knowledge — durable and
-    retrievable, but not canonical truth until reviewed (epistemic status
-    is preserved end-to-end). Include the receipt id in your final answer.
+    TYPED EXTRACTION (optional): `extraction` may carry structured
+    {"entities":[{"name","entity_type","summary"}], "edges":[{"source_entity_name",
+    "target_entity_name","relation_type","fact"}]} aligned with the KB's
+    controlled ontology (entity types like Project/System/Component;
+    relations like PART_OF/DEPENDS_ON/IMPLEMENTS). It is validated against
+    the ontology and rejected with a specific error when invalid. Supplying
+    it makes captured knowledge land as typed graph entities/edges instead
+    of relying on server-side extraction. It is still a PROPOSAL: captured
+    items remain unreviewed agent-reported knowledge until reviewed.
+
+    WHAT YOU GET: a receipt with the event id and processing status, plus
+    extraction_status (validated | unavailable when no inference provider
+    is configured). The item is recorded as UNREVIEWED agent-reported
+    knowledge — durable and retrievable, but not canonical truth until
+    reviewed (epistemic status is preserved end-to-end). Include the
+    receipt id in your final answer.
 
     DOES NOT: overwrite or supersede existing knowledge by itself; make the
     content an approved fact; bypass review for flagged content.
@@ -150,7 +165,7 @@ async def kb_capture(
     return await _kb_capture(
         services, client, kind, title, content,
         project=project, repository=repository, source_uri=source_uri,
-        status=status, tags=tags,
+        status=status, tags=tags, extraction=extraction,
     )
 
 

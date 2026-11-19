@@ -47,6 +47,7 @@ async def server(tmp_path):
             graph_database="test_ns",
             llm_provider="fake",
             environment="development",  # pin: never trust ambient .env
+            allow_static_tokens=True,
             default_namespace="ecosystem-dev",
             allowed_namespaces="ecosystem-dev",
             api_tokens="mcp-test-token",

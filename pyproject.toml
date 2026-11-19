@@ -49,6 +49,7 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
     "embedded: tests that boot an embedded FalkorDB server (need falkordblite)",
     "postgres: tests against a real PostgreSQL server (need pgserver)",
+    "e2e: real-browser end-to-end tests (require chromium; auto-skip otherwise)",
 ]
 filterwarnings = ["ignore::DeprecationWarning"]
 

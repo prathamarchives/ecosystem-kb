@@ -28,6 +28,16 @@ x-kb-app: &kb-app
     KB_DEFAULT_NAMESPACE: ${KB_NAMESPACE:-ecosystem_prod}
     KB_ALLOWED_NAMESPACES: ${KB_NAMESPACE:-ecosystem_prod}
     KB_ENVIRONMENT: production
+    # OAuth + dashboard (runbook Steps 5-6): the publishable anon key and
+    # owner subject pass through from .env; the secret key NEVER enters the
+    # containers (Supabase verifies via public JWKS; admin checks are done
+    # by the app through the Supabase Auth API only if configured).
+    KB_PUBLIC_BASE_URL: ${KB_PUBLIC_BASE_URL:-}
+    KB_MCP_RESOURCE: ${KB_MCP_RESOURCE:-}
+    KB_SUPABASE_URL: ${KB_SUPABASE_URL:-}
+    KB_SUPABASE_ANON_KEY: ${KB_SUPABASE_ANON_KEY:-}
+    KB_OWNER_SUPABASE_SUBJECT: ${KB_OWNER_SUPABASE_SUBJECT:-}
+    KB_ALLOW_LEGACY_CLIENT_TOKENS: ${KB_ALLOW_LEGACY_CLIENT_TOKENS:-false}
   restart: unless-stopped
   networks: [kb-internal]
 
@@ -124,6 +134,10 @@ services:
     # Routes to http://api:8000 and http://ui:3000 — configured in the
     # Cloudflare tunnel. No published ports: outbound-only.
 
+  # Legacy UI container. The dashboard is served by FastAPI at / on the
+  # canonical hostname now (runbook Step 9); this service stays available
+  # only behind the `legacy-ui` profile until the owner confirms cutover
+  # and removes the knowledgebase.itscatalyst.com tunnel route + DNS.
   ui:
     build:
       context: ./ui
@@ -131,6 +145,7 @@ services:
     environment:
       SUPABASE_URL: ${KB_SUPABASE_URL}
       SUPABASE_ANON_KEY: ${KB_SUPABASE_ANON_KEY}
+    profiles: ["legacy-ui"]
     restart: unless-stopped
     networks: [kb-internal]
 

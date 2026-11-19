@@ -76,6 +76,11 @@ def host_env(tmp_path):
         default_namespace="ecosystem-dev",
         allowed_namespaces="ecosystem-dev",
         api_tokens="",
+        # These flows exercise the one-release migration bridge: clients
+        # created by `kb client create` keep working while the owner
+        # reconnects them through OAuth (runbook Step 8 'Legacy client
+        # transition'). Production default remains false.
+        allow_legacy_client_tokens=True,
     )
 
     # Start the API exactly like compose does (own loop; app builds its own graphiti).

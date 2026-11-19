@@ -1,19 +1,49 @@
-"""Application factory: FastAPI app + mounted MCP server, shared services."""
+"""Application factory: FastAPI app + mounted MCP server, shared services.
+
+Public surface (runbook §0.1) — one hostname:
+  /                    owner dashboard (this process, static HTML + JS)
+  /auth/*              Supabase login bootstrap + first-party kb_session
+  /oauth/*             first-party OAuth 2.1 authorization server
+  /v1/*                REST API (bearer or owner session)
+  /mcp                 FastMCP Streamable HTTP (canonical, no trailing slash)
+  /.well-known/*       protected-resource + authorization-server metadata
+"""
 
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
 from contracts.responses import HealthResponse, ReadinessResponse
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 from ecosystem_kb.adapters.graphiti.client import build_graphiti
 from ecosystem_kb.adapters.graphiti.health import check_graph
+from ecosystem_kb.adapters.postgres.oauth_repositories import (
+    AuthorizationCodeRepository,
+    ConsentRepository,
+    OauthClientRepository,
+    PendingAuthorizationRepository,
+    SessionRepository,
+    TokenRepository,
+)
 from ecosystem_kb.adapters.postgres.repositories import ControlPlane, Repositories
 from ecosystem_kb.api.auth import AuthService
 from ecosystem_kb.core.config import KbSettings, get_settings
 from ecosystem_kb.services.event_service import KbServices
 from ecosystem_kb.services.maintenance_service import MaintenanceService
+
+
+def _build_oauth_repositories(cp: ControlPlane) -> dict:
+    """OAuth store repositories over the same control plane."""
+    return {
+        "sessions": SessionRepository(cp.session),
+        "clients": OauthClientRepository(cp.session),
+        "pending": PendingAuthorizationRepository(cp.session),
+        "codes": AuthorizationCodeRepository(cp.session),
+        "tokens": TokenRepository(cp.session),
+        "consents": ConsentRepository(cp.session),
+    }
 
 
 def create_app(
@@ -34,6 +64,9 @@ def create_app(
     from ecosystem_kb.mcp.server import build_mcp_server
 
     mcp = build_mcp_server()
+    # Canonical endpoint is /mcp with NO trailing slash (runbook §1.2.5):
+    # mount the sub-app at the root path inside our /mcp mount, so GET/POST
+    # /mcp hits the protocol handler directly instead of a 307 to /mcp/.
     mcp_asgi = mcp.http_app(path="/")
     mcp_lifespan = mcp_asgi.lifespan
 
@@ -56,6 +89,25 @@ def create_app(
         app.state.services = KbServices(repos, graph, settings)
         app.state.maintenance = MaintenanceService(repos, graph)
         app.state.auth = AuthService(repos, settings)
+        # First-party OAuth AS + owner sessions (runbook Steps 6-8).
+        from ecosystem_kb.api.oauth_server import AuthorizationServer
+
+        oauth_repos = _build_oauth_repositories(cp)
+        oauth_repos["audit"] = repos.audit
+        app.state.oauth = AuthorizationServer(oauth_repos, settings)
+        app.state.oauth_sessions = oauth_repos["sessions"]
+        # The single principal resolver (Step 8): AuthService resolves KB
+        # OAuth tokens through the AS, legacy static tokens behind the flag.
+        app.state.auth.oauth = app.state.oauth
+        app.state.owner_verifier = None
+        if settings.supabase_url and settings.owner_supabase_subject:
+            from ecosystem_kb.api.owner_auth import SupabaseOwnerVerifier
+
+            app.state.owner_verifier = SupabaseOwnerVerifier(
+                settings.supabase_url,
+                settings.owner_supabase_subject,
+                anon_key=settings.supabase_anon_key,
+            )
         # The mounted MCP sub-app replaces scope["app"] with itself, so tools
         # resolving services through the request cannot see THIS app. Mirror
         # the wiring onto the sub-app's own State (its middleware reads
@@ -64,6 +116,7 @@ def create_app(
         mcp_asgi.state.services = app.state.services
         mcp_asgi.state.maintenance = app.state.maintenance
         mcp_asgi.state.auth = app.state.auth
+        mcp_asgi.state.oauth = app.state.oauth
         mcp_asgi.state.kb_root_app = app
         # Chain the MCP sub-app's lifespan (session manager init) inside
         # ours, then serve.
@@ -76,248 +129,61 @@ def create_app(
     app = FastAPI(title="ecosystem-kb", version="0.1.0", lifespan=lifespan)
 
     from ecosystem_kb.api.routes.admin import router as admin_router
+    from ecosystem_kb.api.routes.auth import router as auth_router
+    from ecosystem_kb.api.routes.dashboard import router as dashboard_router
+    from ecosystem_kb.api.routes.dashboard_api import router as dashboard_api_router
     from ecosystem_kb.api.routes.events import router as events_router
     from ecosystem_kb.api.routes.knowledge import router as knowledge_router
     from ecosystem_kb.api.routes.maintenance import router as maintenance_router
-
-    # Browser UI lives on a sibling subdomain; allow its origin to call the API.
-    if settings.supabase_url:
-        from fastapi.middleware.cors import CORSMiddleware
-
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=["https://knowledgebase.itscatalyst.com"],
-            allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
-        )
+    from ecosystem_kb.api.routes.oauth import router as oauth_router
 
     app.include_router(events_router, prefix="/v1")
     app.include_router(knowledge_router, prefix="/v1")
     app.include_router(maintenance_router, prefix="/v1")
     app.include_router(admin_router, prefix="/v1")
+    app.include_router(dashboard_api_router)
+    app.include_router(auth_router)
+    app.include_router(oauth_router)
+    app.include_router(dashboard_router)
 
-    # OAuth 2.1 discovery for MCP clients (RFC 9728 + RFC 8414). Supabase is
-    # the actual issuer; we publish a full AS metadata document here because
-    # Supabase's OIDC discovery omits `registration_endpoint`, which breaks
-    # clients using Dynamic Client Registration (e.g. ChatGPT connectors).
-    if settings.supabase_url:
-        from fastapi.responses import JSONResponse
+    # Metadata (runbook §5.5): issuer is THIS server; endpoints same-origin.
+    resource = settings.canonical_mcp_resource or ""
+    base = (settings.public_base_url or "").rstrip("/")
 
-        _base = (settings.public_base_url or "").rstrip("/")
-        _supabase = settings.supabase_url.rstrip("/") + "/auth/v1"
-        _resource = _base + "/mcp"
-
-        def _protected_resource():
-            return {
-                "resource": _resource,
-                # Point at THIS host so clients fetch our complete AS metadata.
-                "authorization_servers": [_base],
-                "scopes_supported": ["openid", "email", "profile", "kb:read", "kb:write"],
-                "bearer_methods_supported": ["header"],
-            }
-
-        def _as_metadata():
-            # Every endpoint is same-origin with `issuer` — strict MCP clients
-            # reject a metadata document whose endpoints live on another host.
-            return {
-                "issuer": _base,
-                "authorization_endpoint": _base + "/oauth/authorize",
-                "token_endpoint": _base + "/oauth/token",
-                "registration_endpoint": _base + "/oauth/register",
-                "jwks_uri": _base + "/oauth/jwks",
-                "scopes_supported": ["openid", "email", "profile", "offline_access"],
-                "response_types_supported": ["code"],
-                "grant_types_supported": ["authorization_code", "refresh_token"],
-                "code_challenge_methods_supported": ["S256"],
-                "token_endpoint_auth_methods_supported": [
-                    "client_secret_basic", "client_secret_post", "none"
-                ],
-            }
-
-        @app.get("/.well-known/oauth-protected-resource")
-        @app.get("/.well-known/oauth-protected-resource/mcp")
-        async def oauth_protected_resource():
-            return JSONResponse(_protected_resource())
-
-        @app.get("/.well-known/oauth-authorization-server")
-        @app.get("/.well-known/oauth-authorization-server/mcp")
-        async def oauth_authorization_server():
-            return JSONResponse(_as_metadata())
-
-        # Same-origin OAuth proxies. Supabase remains the real issuer; these
-        # just make the advertised endpoints live under our own domain.
-        import httpx
-        from fastapi.responses import RedirectResponse, Response
-
-        @app.get("/oauth/authorize", include_in_schema=False)
-        async def oauth_authorize_proxy(request: Request):
-            return RedirectResponse(
-                _supabase + "/oauth/authorize?" + request.url.query, status_code=302
-            )
-
-        @app.post("/oauth/token", include_in_schema=False)
-        async def oauth_token_proxy(request: Request):
-            body = await request.body()
-            headers = {k.lower(): v for k, v in request.headers.items()
-                       if k.lower() in ("content-type", "authorization")}
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(_supabase + "/oauth/token", content=body, headers=headers)
-            return Response(r.content, r.status_code, media_type=r.headers.get("content-type", "application/json"))
-
-        @app.post("/oauth/register", include_in_schema=False)
-        async def oauth_register_proxy(request: Request):
-            body = await request.body()
-            headers = {k.lower(): v for k, v in request.headers.items()
-                       if k.lower() in ("content-type", "authorization")}
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(_supabase + "/oauth/clients/register", content=body, headers=headers)
-            return Response(r.content, r.status_code, media_type=r.headers.get("content-type", "application/json"))
-
-        @app.get("/oauth/jwks", include_in_schema=False)
-        async def oauth_jwks_proxy():
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.get(_supabase + "/.well-known/jwks.json")
-            return Response(r.content, r.status_code, media_type="application/json")
-
-    # A minimal, connector-friendly OpenAPI document (OpenAPI 3.0.3) for
-    # ChatGPT/agent connectors that reject the auto-generated 3.1 schema
-    # (no server URL, no security scheme, admin endpoints exposed).
-    @app.get("/connector/openapi.json", include_in_schema=False)
-    async def connector_openapi():
-        base = (settings.public_base_url or "").rstrip("/")
-        security = (
-            [{"openIdConnect": [settings.supabase_url.rstrip("/") + "/auth/v1"]}]
-            if settings.supabase_url
-            else [{"bearerAuth": []}]
-        )
-        schemes = {
-            "bearerAuth": {"type": "http", "scheme": "bearer"},
-        }
-        if settings.supabase_url:
-            schemes["openIdConnect"] = {
-                "type": "openIdConnect",
-                "openIdConnectUrl": settings.supabase_url.rstrip("/")
-                + "/auth/v1/.well-known/openid-configuration",
-            }
+    def _protected_resource():
         return {
-            "openapi": "3.0.3",
-            "info": {
-                "title": "ecosystem-kb",
-                "version": "1.0.0",
-                "description": "Shared source-of-truth knowledge graph: search and capture source-backed facts with provenance.",
-            },
-            "servers": [{"url": base}],
-            "security": security,
-            "paths": {
-                "/v1/search": {
-                    "post": {
-                        "operationId": "kb_search",
-                        "summary": "Search the knowledge graph",
-                        "description": "Retrieve source-backed facts about a topic, decision, or entity. Results include provenance and epistemic status.",
-                        "requestBody": {
-                            "required": True,
-                            "content": {
-                                "application/json": {
-                                    "schema": {"$ref": "#/components/schemas/SearchRequest"}
-                                }
-                            },
-                        },
-                        "responses": {
-                            "200": {
-                                "description": "Search results with facts and provenance",
-                                "content": {
-                                    "application/json": {"schema": {"type": "object"}}
-                                },
-                            },
-                            "401": {"description": "Not authenticated"},
-                        },
-                    }
-                },
-                "/v1/events": {
-                    "post": {
-                        "operationId": "kb_capture",
-                        "summary": "Capture durable knowledge",
-                        "description": "Store a decision, finding, or correction as a provenance-bearing knowledge event. Extraction of typed entities happens asynchronously.",
-                        "requestBody": {
-                            "required": True,
-                            "content": {
-                                "application/json": {
-                                    "schema": {"$ref": "#/components/schemas/KnowledgeEvent"}
-                                }
-                            },
-                        },
-                        "responses": {
-                            "200": {
-                                "description": "Event receipt",
-                                "content": {
-                                    "application/json": {"schema": {"type": "object"}}
-                                },
-                            },
-                            "401": {"description": "Not authenticated"},
-                        },
-                    }
-                },
-            },
-            "components": {
-                "securitySchemes": schemes,
-                "schemas": {
-                    "SearchRequest": {
-                        "type": "object",
-                        "required": ["query"],
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "Natural-language search query",
-                            },
-                            "num_results": {"type": "integer", "default": 10},
-                        },
-                    },
-                    "KnowledgeEvent": {
-                        "type": "object",
-                        "required": [
-                            "idempotency_key",
-                            "event_type",
-                            "source",
-                            "timestamps",
-                            "content",
-                        ],
-                        "properties": {
-                            "idempotency_key": {
-                                "type": "string",
-                                "description": "Caller-scoped unique key, e.g. chatgpt:message-123",
-                            },
-                            "event_type": {
-                                "type": "string",
-                                "description": "Namespaced type, e.g. knowledge.decision.recorded",
-                            },
-                            "source": {
-                                "type": "object",
-                                "properties": {
-                                    "system_id": {"type": "string"},
-                                    "record_id": {"type": "string"},
-                                    "canonical_uri": {"type": "string"},
-                                },
-                            },
-                            "timestamps": {
-                                "type": "object",
-                                "properties": {
-                                    "occurred_at": {"type": "string", "format": "date-time"},
-                                    "recorded_at": {"type": "string", "format": "date-time"},
-                                },
-                            },
-                            "content": {
-                                "type": "object",
-                                "properties": {
-                                    "content_type": {"type": "string", "default": "text"},
-                                    "body": {"type": "string"},
-                                },
-                            },
-                        },
-                    },
-                },
-            },
+            "resource": resource,
+            "authorization_servers": [base],
+            "scopes_supported": ["kb:read", "kb:write", "offline_access"],
+            "bearer_methods_supported": ["header"],
         }
+
+    def _as_metadata():
+        metadata = {
+            "issuer": base,
+            "authorization_endpoint": base + "/oauth/authorize",
+            "token_endpoint": base + "/oauth/token",
+            "revocation_endpoint": base + "/oauth/revoke",
+            "registration_endpoint": base + "/oauth/register",
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["none"],
+            "scopes_supported": ["kb:read", "kb:write", "offline_access"],
+        }
+        # CIMD support is advertised only when the fetcher is active (§5.4).
+        metadata["client_id_metadata_document_supported"] = True
+        return metadata
+
+    @app.get("/.well-known/oauth-protected-resource")
+    @app.get("/.well-known/oauth-protected-resource/mcp")
+    async def oauth_protected_resource():
+        return JSONResponse(_protected_resource())
+
+    @app.get("/.well-known/oauth-authorization-server")
+    @app.get("/.well-known/oauth-authorization-server/mcp")
+    async def oauth_authorization_server():
+        return JSONResponse(_as_metadata())
 
     @app.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
@@ -350,8 +216,6 @@ def create_app(
 
     @app.exception_handler(KbError)
     async def kb_error_handler(request, exc: KbError):
-        from fastapi.responses import JSONResponse
-
         return JSONResponse(
             status_code=exc.status_code,
             content={"error": exc.error_code, "message": str(exc), "detail": {}},
@@ -361,14 +225,13 @@ def create_app(
     # The sub-app was built above; its lifespan is chained in ours.
     # A thin ASGI middleware enforces the SAME bearer auth on every MCP
     # request BEFORE the protocol layer runs: unauthenticated clients must
-    # not even complete protocol initialization (plan §F-1).
-    from starlette.responses import JSONResponse
-
+    # not even complete protocol initialization (plan §F-1). It calls the
+    # ONE principal resolver (AuthService.authenticate_token, Step 8), so
+    # MCP and REST accept exactly the same credentials: KB OAuth access
+    # tokens normally; the loopback admin client and the dev/migration
+    # static paths where the settings allow them.
     class McpAuthMiddleware:
-        """Bearer gate for every /mcp request, BEFORE protocol handling:
-        unauthenticated clients must not complete protocol initialization
-        (plan §F-1). Token VALIDATION runs here too — initialize itself
-        carries no tool call where the service layer could reject it."""
+        """Bearer gate for every /mcp request, BEFORE protocol handling."""
 
         def __init__(self, sub_app) -> None:
             self.sub_app = sub_app
@@ -395,20 +258,63 @@ def create_app(
                         error = (401, "invalid_token", "invalid or revoked token")
             if error is not None:
                 status, code, message = error
-                headers = {}
-                if settings.supabase_url and settings.public_base_url:
-                    base = settings.public_base_url.rstrip("/")
-                    headers["WWW-Authenticate"] = (
+                challenge_headers = {}
+                if base and resource:
+                    challenge_headers["WWW-Authenticate"] = (
                         f'Bearer resource_metadata="{base}/.well-known/'
-                        'oauth-protected-resource"'
+                        'oauth-protected-resource/mcp"'
                     )
                 response = JSONResponse(
-                    {"error": code, "message": message}, status_code=status, headers=headers
+                    {"error": code, "message": message},
+                    status_code=status,
+                    headers=challenge_headers,
                 )
                 await response(scope, receive, send)
                 return
             await self.sub_app(scope, receive, send)
 
-    app.mount("/mcp", McpAuthMiddleware(mcp_asgi))
+    # Canonical mount: /mcp (no trailing slash) is the protocol endpoint and
+    # must NOT redirect (runbook §1.2.5; the CI-red trailing-slash bug).
+    # FastAPI's Mount/redirect_slashes 307s bare /mcp to /mcp/ before any
+    # mounted app runs, so we bypass Mount entirely: a raw ASGI wrapper
+    # installed as the LAST route owns /mcp and /mcp/ exactly.
+    class McpEndpointApp:
+        """Owns /mcp and /mcp/ — auth gate + FastMCP sub-app, no redirect."""
+
+        def __init__(self, sub_app) -> None:
+            self.middleware = McpAuthMiddleware(sub_app)
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http":
+                await self.middleware(scope, receive, send)
+                return
+            path = scope.get("path", "")
+            if path in ("/mcp", "/mcp/"):
+                # Reproduce exactly what Starlette Mount('/mcp') does for the
+                # slashed form: root_path gains the mount prefix and the
+                # sub-app's internal router sees its own root path.
+                scope = dict(scope)
+                scope["root_path"] = scope.get("root_path", "") + "/mcp"
+                scope["path"] = "/" if path == "/mcp" else "/"
+            await self.middleware(scope, receive, send)
+
+    # Register as a catch-route AFTER include_router calls but with explicit
+    # path matching, using Starlette Route with the raw ASGI callable.
+    from starlette.routing import Route
+
+    mcp_route = Route(
+        "/mcp",
+        endpoint=McpEndpointApp(mcp_asgi),
+        methods=["GET", "POST", "DELETE", "OPTIONS", "HEAD", "PUT", "PATCH"],
+        name="mcp",
+    )
+    mcp_route_slash = Route(
+        "/mcp/",
+        endpoint=McpEndpointApp(mcp_asgi),
+        methods=["GET", "POST", "DELETE", "OPTIONS", "HEAD", "PUT", "PATCH"],
+        name="mcp-slash-alias",
+    )
+    app.router.routes.append(mcp_route)
+    app.router.routes.append(mcp_route_slash)
 
     return app
