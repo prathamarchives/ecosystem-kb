@@ -184,7 +184,7 @@ class TestMetadata:
         )
         assert meta["code_challenge_methods_supported"] == ["S256"]
         assert meta["token_endpoint_auth_methods_supported"] == ["none"]
-        assert meta["client_id_metadata_document_supported"] is True
+        assert "client_id_metadata_document_supported" not in meta
 
 
 class TestMcpEndpoint:

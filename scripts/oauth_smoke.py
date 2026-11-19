@@ -96,7 +96,7 @@ def main() -> int:
         check("ASM issuer", meta.get("issuer") == "https://kb.itscatalyst.com")
         check("ASM S256 only", meta.get("code_challenge_methods_supported") == ["S256"])
         check("ASM auth none", meta.get("token_endpoint_auth_methods_supported") == ["none"])
-        check("ASM CIMD", meta.get("client_id_metadata_document_supported") is True)
+        check("ASM CIMD not advertised", "client_id_metadata_document_supported" not in meta)
 
         # -- canonical /mcp: no redirect ----------------------------------
         r = client.get("/mcp")

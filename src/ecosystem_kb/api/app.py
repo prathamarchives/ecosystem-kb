@@ -171,8 +171,9 @@ def create_app(
             "token_endpoint_auth_methods_supported": ["none"],
             "scopes_supported": ["kb:read", "kb:write", "offline_access"],
         }
-        # CIMD support is advertised only when the fetcher is active (§5.4).
-        metadata["client_id_metadata_document_supported"] = True
+        # CIMD is intentionally NOT advertised: clients fall back to DCR,
+        # which registers the loopback redirect URI with its concrete port
+        # (OpenCode's CIMD document only lists portless loopbacks).
         return metadata
 
     @app.get("/.well-known/oauth-protected-resource")
