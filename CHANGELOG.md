@@ -37,7 +37,45 @@ Graphiti adapter (embedded-FalkorDB verified), REST + MCP gateway, workers, main
   old direct-call tests.
 
 ### Verified
-- Full suite: 122 passed / 2 skipped (unit 60, contract 15, security 12,
-  integration 32, eval 3) — count as of final run.
+- Full suite at merge time: 141 passed / 2 skipped (unit 60, contract 15
+  incl. 11 protocol-over-HTTP, security 12, integration 35 incl. 3 eval).
+  (An earlier draft of this entry said 122; the final run count is 141.)
 - Deployment drill: 27/27 including real backup + restore into fresh
   PostgreSQL + FalkorDB instances.
+
+## [0.2.1] — 2026-11-19 — final onboarding repair (repair/onboarding-host-cli)
+
+### Fixed
+- Host CLI control-plane access: the direct `127.0.0.1:5432` connection
+  was invalid with the private Compose network. All client-management,
+  status and doctor operations now go through the loopback admin API
+  (`/v1/admin/*`, kb:admin scope, audited, REST-only; never MCP tools).
+  `kb-admin` is seeded from `KB_ADMIN_TOKEN` by the compose migrate
+  one-shot (ADR-019).
+- API published loopback-only: `127.0.0.1:${KB_BIND_PORT:-8000}:8000`;
+  KB_BIND_HOST/PORT drive the CLI; databases remain unpublished.
+- Connect wizard: default client id from target; no silent rotation
+  (explicit `--rotate` required); Cursor output is valid JSON with real
+  values, parsed before display; `--write`/`--path` merge into mcp.json
+  preserving unrelated servers; credentials shown once.
+- Doctor: mandatory failures separated from optional-provisioning
+  warnings (local-only tunnel, no-backup-yet, LLM=read-only); clean
+  local-only install exits 0; `--strict` for fully provisioned checks.
+- Install-path bug: deployment state anchored to the working directory
+  (was derived from the installed package location); environment
+  variables override .env values.
+
+### Added
+- `/v1/admin` routes (create/list/revoke/rotate/stats) with audit records
+  and MCP-surface isolation tests; `ClientRepository.get/ensure_admin_client`.
+- `kb bootstrap --seed-admin`; `kb connect cursor --write/--path`.
+- tests/contract/test_admin_api.py (6, real HTTP), 
+  tests/integration/test_host_cli.py (9, real `kb` subprocess flows),
+  scripts/host_acceptance.sh (owner-host Docker-level §6 checks).
+- CI: host CLI flows + extraction eval (fake provider) in the embedded
+  job. docs/HOST-CLI-ARCHITECTURE.md; ADR-019.
+
+### Verified
+- Branch final run: 137 passed / 2 skipped; ruff clean; drill 27/27.
+  Breakdown: unit 60, contract 21 (15 protocol + 6 admin), security 12,
+  integration 44 (32 + 9 host + 3 eval).
