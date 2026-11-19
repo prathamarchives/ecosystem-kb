@@ -4,3 +4,40 @@
 
 Initial scaffold: governance, ontology v0.1, kb.event.v1 contracts, control plane,
 Graphiti adapter (embedded-FalkorDB verified), REST + MCP gateway, workers, maintainer core.
+
+## [0.2.0] — 2026-11-19 — plug-and-play local + tunnel milestone (branch feat/plug-and-play-local-tunnel)
+
+### Added
+- `deploy/compose.local.yaml`: self-contained local stack (PostgreSQL 16.9,
+  FalkorDB 4.22.1, one-shot migrate, api, worker, optional cloudflared
+  tunnel profile; private network, no published DB ports, healthchecks,
+  restart policies, named volumes).
+- `kb` CLI: `setup` (0600 .env + generated secrets), `up/down/restart/logs/
+  status/doctor/nuke`, `client create/list/revoke/rotate`, `connect
+  claude-code|cursor|generic`, `disconnect`, `tunnel status`, `backup` /
+  `restore` (manifest + checksums + atomic publish; checksum-gated restore).
+- MCP tools `kb_context` (task-shaped bounded retrieval) and `kb_capture`
+  (plain structured fields → kb.event.v1 through the existing pipeline;
+  per-client source identity; epistemic note; actor from the credential).
+- Product-grade tool descriptions (when/what/means/does-not) on all tools.
+- Protocol-level MCP tests over real Streamable HTTP (AT-03/04/09
+  equivalents), auth negatives (missing/invalid/revoked/read-only), actor
+  attribution checks.
+- 30-case labelled extraction eval set + harness (LAW invariants asserted;
+  quality reported, not gated) and `docs/EVAL.md`.
+- Docs: PLUG-AND-PLAY-ACCEPTANCE.md, GAP-REPORT.md, TUNNEL-SETUP.md,
+  clients/CONNECT.md, clients/AGENT-INSTRUCTIONS.md.
+
+### Fixed
+- **`/mcp` was never reachable over HTTP**: sub-app lifespan never ran
+  (FastAPI custom lifespan replaced it), tools could not resolve services
+  (sub-app replaces scope["app"]), and initialize succeeded without a valid
+  token. Fixed by ADR-018 (chained lifespan, mirrored state, pre-protocol
+  auth middleware). Uncovered by the new protocol tests; invisible to the
+  old direct-call tests.
+
+### Verified
+- Full suite: 122 passed / 2 skipped (unit 60, contract 15, security 12,
+  integration 32, eval 3) — count as of final run.
+- Deployment drill: 27/27 including real backup + restore into fresh
+  PostgreSQL + FalkorDB instances.

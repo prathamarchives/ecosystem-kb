@@ -245,6 +245,8 @@ async def _cmd_status(args) -> None:
     line("FalkorDB", states.get("falkordb", "not created"))
     line("Worker", states.get("worker", "not created"))
     line("Cloudflared", states.get("cloudflared", "off (no token)" if not env.get("CF_TUNNEL_TOKEN") else "not created"))
+    mcp_ok = await _mcp_probe()
+    line("MCP endpoint", "healthy (initialize ok)" if mcp_ok else "not reachable on the local port")
     ready = await _api_json("/ready")
     if ready:
         line("Readiness", "ready" if ready.get("ready") else "degraded")
@@ -254,6 +256,7 @@ async def _cmd_status(args) -> None:
         line("Readiness", "api not reachable on the local port")
     if env.get("KB_PUBLIC_URL"):
         line("Public URL", env["KB_PUBLIC_URL"] + "/mcp")
+    line("Last backup", _last_backup() or "none yet — run `kb backup`")
     # Knowledge + queue snapshot through the control plane.
     try:
         cp, repos, _ = await _open_control_plane()
