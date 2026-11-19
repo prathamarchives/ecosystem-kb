@@ -146,9 +146,6 @@ class TestExtractionBaseline:
                 rows.append((case["id"], case["category"], "policy-reject"))
                 continue
             payload = _expected_payload(case)
-            canonical_edges = [e for e in payload["edges"]
-                               if e["relation_type"] in RELATIONSHIP_DOMAIN_RANGE]
-            noncanonical = len(payload["edges"]) - len(canonical_edges)
             event = marker_event(f"eval:{case['id'].lower()}", payload)
             outcome = await ingest_event(eval_env["graphiti"], event, "eval-ns")
             entity_writes += outcome.entities_written
