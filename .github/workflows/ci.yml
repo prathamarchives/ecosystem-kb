@@ -37,6 +37,14 @@ jobs:
       - run: pip install -e ".[dev,embedded]"
       - run: pytest tests/integration/test_vertical_slice.py tests/integration/test_fault_injection.py tests/integration/test_arivoo_integration.py tests/contract -q
       - run: pytest tests/security -q
+      # Host-level CLI flows + admin API run against a real uvicorn server
+      # on the runner (the Compose-level variants run on the owner host via
+      # scripts/host_acceptance.sh).
+      - run: pytest tests/integration/test_host_cli.py -q
+      # Extraction eval with the deterministic fake provider (repair §5):
+      # proves the labelled set flows through the real pipeline in CI; the
+      # real-provider runbook stays in docs/EVAL.md.
+      - run: pytest tests/integration/test_extraction_eval.py -q
 
   postgres-integration:
     # Real PostgreSQL via pgserver; exercises migrations, atomic submit,
