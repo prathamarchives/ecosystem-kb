@@ -35,7 +35,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev,embedded]"
-      - run: pytest tests/integration/test_vertical_slice.py tests/integration/test_fault_injection.py tests/contract -q
+      - run: pytest tests/integration/test_vertical_slice.py tests/integration/test_fault_injection.py tests/integration/test_arivoo_integration.py tests/contract -q
       - run: pytest tests/security -q
 
   postgres-integration:
@@ -49,3 +49,20 @@ jobs:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
       - run: pytest tests/integration/test_postgres.py -q
+
+  docker-build:
+    # The production image must build and pass its self-check (review P0:
+    # asyncpg runtime dep + migrations present inside the image).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: false
+          tags: ecosystem-kb:ci
+          load: true
+      - name: Run the image self-check directly
+        run: docker run --rm ecosystem-kb:ci python -c "import asyncpg, ecosystem_kb.adapters.postgres.migrations as m; assert m.load_migrations(), 'migrations missing'"
