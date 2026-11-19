@@ -21,17 +21,29 @@ from fastmcp.server.dependencies import get_http_request
 
 
 async def _aresolve(request) -> tuple:
-    """Async resolution — every tool uses this."""
+    """Async resolution — every tool uses this.
+
+    The mounted MCP sub-app REPLACES scope["app"] with itself (Starlette
+    semantics), so the FastAPI parent is not reachable through the scope.
+    create_app() mirrors the service wiring onto the sub-app's own state at
+    startup; resolve through that.
+    """
     from ecosystem_kb.core.exceptions import AuthenticationError
 
     header = request.headers.get("authorization", "")
     if not header.lower().startswith("bearer "):
         raise AuthenticationError("missing bearer token")
     token = header[7:].strip()
-    root = request.scope.get("root_app") or request.scope.get("app")
-    services = root.state.services
-    maintenance = root.state.maintenance
-    client = await root.state.auth.authenticate_token(token)
+    app = request.scope.get("app")
+    state = getattr(app, "state", None)
+    services = getattr(state, "services", None)
+    maintenance = getattr(state, "maintenance", None)
+    auth = getattr(state, "auth", None)
+    if services is None or auth is None:
+        raise RuntimeError(
+            "MCP sub-app state is not wired; was this app built by create_app()?"
+        )
+    client = await auth.authenticate_token(token)
     return services, maintenance, client
 
 
@@ -40,13 +52,106 @@ mcp = FastMCP("ecosystem-kb")
 
 @mcp.tool
 async def kb_search(query: str, num_results: int = 10, namespace: str | None = None) -> dict[str, Any]:
-    """Search the shared knowledge graph. Returns facts with provenance,
-    temporal windows, and surfaced contradictions."""
+    """Search the shared knowledge graph.
+
+    WHEN TO CALL: you need facts about entities, systems, or past work; when
+    checking whether something is already known/decided before acting.
+
+    WHAT TO SUPPLY: a natural-language query (what you want to know).
+
+    WHAT YOU GET: facts with provenance (source reference), temporal windows
+    (valid_at/invalid_at), epistemic status (proposed/accepted/superseded/
+    disputed), and surfaced contradictions. Results are retrieval hits —
+    source-backed but not verified truth; check review/evidence status.
+
+    DOES NOT: modify anything; guarantee completeness (bounded result set).
+    """
     services, _, client = await _aresolve(get_http_request())
     result = await services.search(
         client, SearchRequest(query=query, num_results=num_results, namespace=namespace)
     )
     return result.model_dump(mode="json")
+
+
+@mcp.tool
+async def kb_context(
+    query: str,
+    project: str | None = None,
+    repository: str | None = None,
+    include_decisions: bool = True,
+    include_constraints: bool = True,
+    include_history: bool = False,
+    limit: int = 12,
+) -> dict[str, Any]:
+    """Retrieve the working context for a task — call this BEFORE substantial work.
+
+    WHEN TO CALL: at the start of any non-trivial task (implementation,
+    debugging, design), with the task description and, when known, the
+    project/repository scope.
+
+    WHAT TO SUPPLY: the task in natural language; optional project and
+    repository names to narrow retrieval.
+
+    WHAT YOU GET: a bounded, task-shaped bundle — current decisions and
+    constraints (treat as constraints, not suggestions), related facts, and
+    any known contradictions or uncertainty. Superseded items are hidden
+    unless include_history=True. Every item carries provenance and epistemic
+    status.
+
+    DOES NOT: execute anything or modify the graph. If context conflicts
+    with the current repository state or a newer verified source, surface
+    the conflict — do not blindly follow stale memory.
+    """
+    from ecosystem_kb.services.high_level import kb_context as _kb_context
+
+    services, _, client = await _aresolve(get_http_request())
+    return await _kb_context(
+        services, client, query,
+        project=project, repository=repository,
+        include_decisions=include_decisions, include_constraints=include_constraints,
+        include_history=include_history, limit=limit,
+    )
+
+
+@mcp.tool
+async def kb_capture(
+    kind: str,
+    title: str,
+    content: str,
+    project: str | None = None,
+    repository: str | None = None,
+    source_uri: str | None = None,
+    status: str = "proposed",
+    tags: list[str] | None = None,
+) -> dict[str, Any]:
+    """Capture durable knowledge — decisions, findings, corrections, resolved problems.
+
+    WHEN TO CALL: after making a decision, discovering something durable
+    (an important correction, a resolved problem, a finding worth keeping),
+    or recording a requirement. Do NOT capture transient chatter, secrets,
+    speculation presented as fact, or entire transcripts.
+
+    WHAT TO SUPPLY: kind (decision|finding|correction|note|claim|experiment|
+    system), a short title, the content itself, and optionally project,
+    repository, source_uri (commit/PR/URL backing this), status
+    (proposed|accepted|superseded|rejected|disputed), tags.
+
+    WHAT YOU GET: a receipt with the event id and processing status. The
+    item is recorded as UNREVIEWED agent-reported knowledge — durable and
+    retrievable, but not canonical truth until reviewed (epistemic status
+    is preserved end-to-end). Include the receipt id in your final answer.
+
+    DOES NOT: overwrite or supersede existing knowledge by itself; make the
+    content an approved fact; bypass review for flagged content.
+    """
+    from ecosystem_kb.services.high_level import kb_capture as _kb_capture
+
+    services, _, client = await _aresolve(get_http_request())
+    return await _kb_capture(
+        services, client, kind, title, content,
+        project=project, repository=repository, source_uri=source_uri,
+        status=status, tags=tags,
+    )
 
 
 @mcp.tool

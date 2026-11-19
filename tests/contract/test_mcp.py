@@ -50,7 +50,7 @@ async def mcp_app(embedded_graph, tmp_path):
 
 
 class TestMcpTools:
-    async def test_seven_tools_registered(self, mcp_app):
+    async def test_nine_tools_registered(self, mcp_app):
         from ecosystem_kb.mcp.server import build_mcp_server
 
         server = build_mcp_server()
@@ -58,6 +58,8 @@ class TestMcpTools:
         names = {t.name for t in tools}
         assert names == {
             "kb_search",
+            "kb_context",
+            "kb_capture",
             "kb_get_entity",
             "kb_get_context",
             "kb_get_provenance",
