@@ -734,7 +734,8 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="kb", description="ecosystem-kb CLI")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("setup", help="First-run: create .env with generated secrets")
+    p_setup = sub.add_parser("setup", help="First-run: create .env with generated secrets")
+    p_setup.add_argument("--force", action="store_true", help="regenerate .env even if one exists")
     sub.add_parser("up", help="Start the local stack (Docker Compose)")
     sub.add_parser("down", help="Stop the stack (volumes preserved)")
     sub.add_parser("restart", help="Stop then start the stack")
