@@ -146,3 +146,20 @@ executes the review's Gate 5 acceptance: HTTPS submit, idempotency,
 authz enforcement, second-client provenance retrieval, and a REAL
 backup+restore of both stores with consistency checks. **Result:** 27/27
 checks pass. The drill doubles as the VM deployment procedure.
+
+
+## ADR-017 · Local host + named Cloudflare Tunnel is a replaceable transport, not an architecture
+**Status:** Accepted (2026-11-19). **Decision:** the plug-and-play milestone
+deploys the stack on the owner's machine via a dedicated local Compose profile
+(`deploy/compose.local.yaml`) with a remotely managed named Cloudflare Tunnel
+routing `https://kb.<domain>` to `http://api:8000` over the private Compose
+network. The application interface (MCP tools, REST contracts, kb.event.v1)
+carries zero hosting knowledge: no code path may depend on Cloudflare, on the
+tunnel, or on the local topology. A later VM migration moves volumes/backups
+and re-points the tunnel connector only — client configurations and tool
+semantics stay unchanged. **Rationale:** plan §1/§17; the stable interface is
+the product and hosting is replaceable. **Consequences:** Caddy TLS remains
+only in the self-hosted-VM profile (never stacked inside the local tunnel
+route); no Quick Tunnel as the daily endpoint (ephemeral URL, no SSE); no
+mandatory Cloudflare Access layer in v1 (unattended MCP clients must connect
+without interactive login).
