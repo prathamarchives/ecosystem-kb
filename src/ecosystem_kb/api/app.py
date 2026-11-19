@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from contracts.responses import HealthResponse, ReadinessResponse
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from ecosystem_kb.adapters.graphiti.client import build_graphiti
 from ecosystem_kb.adapters.graphiti.health import check_graph
@@ -118,13 +118,15 @@ def create_app(
             }
 
         def _as_metadata():
+            # Every endpoint is same-origin with `issuer` — strict MCP clients
+            # reject a metadata document whose endpoints live on another host.
             return {
                 "issuer": _base,
-                "authorization_endpoint": _supabase + "/oauth/authorize",
-                "token_endpoint": _supabase + "/oauth/token",
-                "registration_endpoint": _supabase + "/oauth/clients/register",
-                "jwks_uri": _supabase + "/.well-known/jwks.json",
-                "scopes_supported": ["openid", "email", "profile", "phone", "offline_access", "kb:read", "kb:write"],
+                "authorization_endpoint": _base + "/oauth/authorize",
+                "token_endpoint": _base + "/oauth/token",
+                "registration_endpoint": _base + "/oauth/register",
+                "jwks_uri": _base + "/oauth/jwks",
+                "scopes_supported": ["openid", "email", "profile", "offline_access"],
                 "response_types_supported": ["code"],
                 "grant_types_supported": ["authorization_code", "refresh_token"],
                 "code_challenge_methods_supported": ["S256"],
@@ -142,6 +144,41 @@ def create_app(
         @app.get("/.well-known/oauth-authorization-server/mcp")
         async def oauth_authorization_server():
             return JSONResponse(_as_metadata())
+
+        # Same-origin OAuth proxies. Supabase remains the real issuer; these
+        # just make the advertised endpoints live under our own domain.
+        import httpx
+        from fastapi.responses import RedirectResponse, Response
+
+        @app.get("/oauth/authorize", include_in_schema=False)
+        async def oauth_authorize_proxy(request: Request):
+            return RedirectResponse(
+                _supabase + "/oauth/authorize?" + request.url.query, status_code=302
+            )
+
+        @app.post("/oauth/token", include_in_schema=False)
+        async def oauth_token_proxy(request: Request):
+            body = await request.body()
+            headers = {k.lower(): v for k, v in request.headers.items()
+                       if k.lower() in ("content-type", "authorization")}
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(_supabase + "/oauth/token", content=body, headers=headers)
+            return Response(r.content, r.status_code, media_type=r.headers.get("content-type", "application/json"))
+
+        @app.post("/oauth/register", include_in_schema=False)
+        async def oauth_register_proxy(request: Request):
+            body = await request.body()
+            headers = {k.lower(): v for k, v in request.headers.items()
+                       if k.lower() in ("content-type", "authorization")}
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(_supabase + "/oauth/clients/register", content=body, headers=headers)
+            return Response(r.content, r.status_code, media_type=r.headers.get("content-type", "application/json"))
+
+        @app.get("/oauth/jwks", include_in_schema=False)
+        async def oauth_jwks_proxy():
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(_supabase + "/.well-known/jwks.json")
+            return Response(r.content, r.status_code, media_type="application/json")
 
     # A minimal, connector-friendly OpenAPI document (OpenAPI 3.0.3) for
     # ChatGPT/agent connectors that reject the auto-generated 3.1 schema
