@@ -135,7 +135,9 @@ async def kb_capture(
 
     event = KnowledgeEvent(
         event_id=uuid4(),
-        idempotency_key=f"mcp:{client.client_id}:{pysecrets.token_hex(8)}",
+        # OAuth client IDs may contain uppercase (DCR token_urlsafe output);
+        # the event contract requires a lowercase slug.
+        idempotency_key=f"mcp:{client.client_id.lower()}:{pysecrets.token_hex(8)}",
         event_type=CAPTURE_KINDS[kind],
         source=EventSource(
             system_id=source_id,

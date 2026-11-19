@@ -226,6 +226,28 @@ class TestCaptureIntegration:
         # fake provider: extraction is honestly reported unavailable
         assert "unavailable" in receipt["extraction_status"]
 
+    async def test_capture_accepts_mixed_case_oauth_client_id(self, services, control_plane):
+        """DCR client IDs contain uppercase; the event contract requires a
+        lowercase slug, so kb_capture must normalize the idempotency key."""
+        from ecosystem_kb.services.high_level import kb_capture
+
+        client = AuthenticatedClient(
+            client_id="client-fYtA63qaNnXgGodB75FtBQ",
+            scopes=["kb:read", "kb:write"],
+            allowed_namespaces=["ecosystem-dev"],
+            allowed_sources=["*"],
+            default_namespace="ecosystem-dev",
+        )
+        await control_plane.sources.upsert(
+            source_id=f"system:mcp:{client.client_id}",
+            canonical_uri=f"mcp://{client.client_id}/",
+            source_type="mcp_client",
+            owner_system=f"system:mcp:{client.client_id}",
+            trust_class="agent_reported",
+        )
+        receipt = await kb_capture(services, client, "note", "mixed case", "content")
+        assert receipt["event_id"]
+
     async def test_duplicate_capture_is_idempotent(self, services, control_plane):
         """The idempotency key is random per call, so two captures with the
         same content are two events — but the SAME extraction payload must
