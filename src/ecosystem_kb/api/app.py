@@ -28,8 +28,14 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Production safety: refuse unsafe configs before serving traffic.
+        settings.validate_runtime_safety()
         cp = control_plane or ControlPlane(settings.database_url)
-        await cp.create_all()
+        # Versioned migrations are the schema mechanism (review P1);
+        # create_all is only a dev/test shortcut on throwaway databases.
+        from ecosystem_kb.adapters.postgres.migrations import migrate
+
+        await migrate(cp.engine)
         repos = Repositories(cp)
         graph = graphiti if graphiti is not None else build_graphiti(settings)
         app.state.settings = settings
@@ -63,7 +69,7 @@ def create_app(
         checks: dict = {}
         ready = True
         try:
-            counts = await app.state.control_plane.table_counts()
+            await app.state.control_plane.table_counts()
             checks["control_plane"] = "ok"
         except Exception as exc:
             checks["control_plane"] = f"error: {exc}"

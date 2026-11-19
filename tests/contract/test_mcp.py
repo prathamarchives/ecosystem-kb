@@ -27,6 +27,16 @@ async def mcp_app(embedded_graph, tmp_path):
     )
     cp = ControlPlane(settings.database_url)
     await cp.create_all()
+    from ecosystem_kb.adapters.postgres.repositories import Repositories as _R
+
+    # Register the source the test producer submits on behalf of.
+    await _R(cp).sources.upsert(
+        source_id="system:arivoo",
+        canonical_uri="arivoo://",
+        source_type="note",
+        owner_system="system:arivoo",
+        trust_class="system_generated",
+    )
     app = create_app(settings=settings, graphiti=embedded_graph, control_plane=cp)
     app.state.settings = settings
     app.state.control_plane = cp

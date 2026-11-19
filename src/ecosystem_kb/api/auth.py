@@ -30,11 +30,17 @@ class AuthService:
             raise AuthenticationError("missing bearer token")
         row = await self.repos.clients.find_by_token(token)
         if row is None:
+            # Static fallback tokens are a DEVELOPMENT convenience only.
+            if self.settings.is_production:
+                raise AuthenticationError("invalid token")
             if token in self.settings.token_list:
                 return AuthenticatedClient(
                     client_id="local-dev",
                     scopes=["kb:read", "kb:write", "kb:review", "kb:maintain", "kb:admin"],
                     allowed_namespaces=self.settings.namespace_list,
+                    default_namespace=self.settings.default_namespace
+                    if self.settings.default_namespace in self.settings.namespace_list
+                    else None,
                 )
             raise AuthenticationError("invalid token")
         if row.status != "active":
@@ -43,6 +49,7 @@ class AuthService:
             client_id=row.client_id,
             scopes=list(row.scopes or []),
             allowed_namespaces=list(row.allowed_namespaces or []),
+            allowed_sources=list(getattr(row, "allowed_sources", None) or ["*"]),
         )
 
     async def authenticate(

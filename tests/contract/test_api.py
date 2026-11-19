@@ -28,6 +28,16 @@ async def api(embedded_graph, tmp_path):
     )
     cp = ControlPlane(settings.database_url)
     await cp.create_all()
+    from ecosystem_kb.adapters.postgres.repositories import Repositories as _R
+
+    # Register the source the test producer submits on behalf of.
+    await _R(cp).sources.upsert(
+        source_id="system:arivoo",
+        canonical_uri="arivoo://",
+        source_type="note",
+        owner_system="system:arivoo",
+        trust_class="system_generated",
+    )
     app = create_app(settings=settings, graphiti=embedded_graph, control_plane=cp)
     # Lifespan-equivalent wiring (ASGITransport does not run lifespans).
     app.state.settings = settings
@@ -51,14 +61,14 @@ async def api(embedded_graph, tmp_path):
 AUTH = {"Authorization": "Bearer test-admin-token"}
 
 
-async def _drain(app):
+async def _drain(app, worker_id="test-worker"):
     services = app.state.services
     while True:
-        job = await services.repos.events.claim_next_job("test-worker")
+        job = await services.repos.events.claim_next_job(worker_id)
         if job is None:
             break
         await services.process_event(job.event_row_id)
-        await services.repos.events.complete_job(job.id)
+        await services.repos.events.complete_job(job.id, worker_id)
 
 
 class TestHealth:

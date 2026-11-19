@@ -13,7 +13,9 @@ from ecosystem_kb.core.config import KbSettings, get_settings
 
 async def _bootstrap(settings: KbSettings, dev_token: str | None) -> None:
     cp = ControlPlane(settings.database_url)
-    await cp.create_all()
+    from ecosystem_kb.adapters.postgres.migrations import migrate
+
+    await migrate(cp.engine)
     repos = Repositories(cp)
     token = dev_token or "local-dev-token-1"
     existing = await repos.clients.find_by_token(token)
@@ -45,8 +47,11 @@ async def _register_client(args) -> None:
 
 async def _run_worker() -> None:
     settings = get_settings()
+    settings.validate_runtime_safety()
     cp = ControlPlane(settings.database_url)
-    await cp.create_all()
+    from ecosystem_kb.adapters.postgres.migrations import migrate
+
+    await migrate(cp.engine)
     graphiti = build_graphiti(settings)
     await graphiti.build_indices_and_constraints()
 

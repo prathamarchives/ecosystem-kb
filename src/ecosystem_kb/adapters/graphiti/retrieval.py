@@ -36,10 +36,11 @@ async def search(
         num_results=request.num_results,
     )
 
-    # LAW-006 quarantine at the retrieval boundary: graphiti may persist
-    # unmapped predicates (spec §19.2); canonical results never serve them.
-    # They surface through the review queue, not through search.
-    vocabulary = set(REGISTRY.relationship_names) | {"RELATES_TO"}
+    # LAW-006 at the retrieval boundary (review P1): ONLY canonical
+    # relationship names are served. RELATES_TO is graphiti's fallback for
+    # unmapped predicates — it is never a canonical fact. Quarantined
+    # relations surface through the review queue, not search.
+    vocabulary = set(REGISTRY.relationship_names)
     quarantined = [e for e in edges if e.name.upper() not in vocabulary]
     edges = [e for e in edges if e.name.upper() in vocabulary]
 
@@ -91,6 +92,7 @@ async def entity_context(
     graphiti: Graphiti,
     canonical_key: str,
     namespace: str,
+    provenance_resolver=None,
 ) -> EntityContextResponse | None:
     """Entity + its connected facts. Returns None when the entity is unknown."""
     from ecosystem_kb.adapters.graphiti.reconciliation import edges_touching_entity
@@ -100,18 +102,28 @@ async def entity_context(
         return None
     entity, related = record
 
-    related_facts = [
-        FactResult(
-            fact=edge.fact,
-            relation=edge.name.upper(),
-            source_name=entity.name if edge.source_node_uuid == entity.uuid else None,
-            target_name=entity.name if edge.target_node_uuid == entity.uuid else None,
-            valid_at=edge.valid_at,
-            invalid_at=edge.invalid_at,
-            expired_at=edge.expired_at,
+    vocabulary = set(REGISTRY.relationship_names)
+    related_facts = []
+    for edge in related:
+        if edge.name.upper() not in vocabulary:
+            continue  # non-canonical edges never served (LAW-006)
+        provenance = None
+        source_reference = None
+        if provenance_resolver is not None:
+            provenance, source_reference = await provenance_resolver(edge)
+        related_facts.append(
+            FactResult(
+                fact=edge.fact,
+                relation=edge.name.upper(),
+                source_name=entity.name if edge.source_node_uuid == entity.uuid else None,
+                target_name=entity.name if edge.target_node_uuid == entity.uuid else None,
+                valid_at=edge.valid_at,
+                invalid_at=edge.invalid_at,
+                expired_at=edge.expired_at,
+                provenance=provenance,
+                source_reference=source_reference,
+            )
         )
-        for edge in related
-    ]
     return EntityContextResponse(
         entity=EntityResult(
             canonical_key=canonical_key,

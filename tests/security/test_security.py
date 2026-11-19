@@ -50,10 +50,7 @@ class TestAuthorization:
                 reader_client, SearchRequest(query="x", namespace="ecosystem-prod")
             )
 
-    async def test_maintenance_scope_required(self, services, reader_client):
-        from ecosystem_kb.services.maintenance_service import MaintenanceService
-
-        maintenance = MaintenanceService(services.repos, services.graphiti)
+    async def test_maintenance_scope_required(self, reader_client):
         if "kb:maintain" not in reader_client.scopes:
             pytest.skip("enforced at route/tool layer; service trusts the gate")
 

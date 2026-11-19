@@ -1,7 +1,15 @@
-"""Async control-plane repositories over the 8 tables.
+"""Async control-plane repositories.
 
-Idempotency at ingress (LAW-008), job claiming with leases (ADR-008),
-append-only audit (LAW-014), token-hash authn records (LAW-009).
+Gate 1b (review P1):
+  - submit is ONE transaction: ledger row + full envelope payload + job.
+  - idempotency compares request fingerprints: same key + same payload is a
+    duplicate; same key + different payload is a CONFLICT.
+  - source-ownership authorization (client.allowed_sources).
+Gate 2 (review P1):
+  - atomic job claim via UPDATE...RETURNING (SKIP LOCKED on Postgres).
+  - FIFO by created_at/next_attempt_at, not UUID order.
+  - lease recovery: expired processing leases are re-queued on claim.
+  - ownership-guarded completion; bounded backoff; dead-letter state.
 """
 
 from __future__ import annotations
@@ -9,9 +17,15 @@ from __future__ import annotations
 import hashlib
 import secrets
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 
-from sqlalchemy import func, select, update
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy import func, select, text, update
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from ecosystem_kb.adapters.postgres.models import (
     ALL_TABLES,
@@ -22,14 +36,27 @@ from ecosystem_kb.adapters.postgres.models import (
     KbEntityIdentity,
     KbEvent,
     KbIngestionJob,
+    KbMaintenanceAction,
+    KbProvenanceLink,
     KbReviewQueue,
     KbSource,
 )
+from ecosystem_kb.core.exceptions import ConflictError
 from ecosystem_kb.core.lifecycle import IngestionEventState, transition_ingestion
 
 
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def request_fingerprint(payload: str) -> str:
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+class SubmitOutcome(StrEnum):
+    CREATED = "created"
+    DUPLICATE = "duplicate"
+    CONFLICT = "conflict"
 
 
 class ControlPlane:
@@ -68,7 +95,7 @@ class EventRepository:
     def __init__(self, cp: ControlPlane) -> None:
         self.cp = cp
 
-    async def insert_event(
+    async def submit_event(
         self,
         *,
         event_id: str,
@@ -78,36 +105,55 @@ class EventRepository:
         source_revision: str | None,
         event_type: str,
         namespace: str,
-        payload_reference: str,
+        content_reference: str,
         content_hash: str | None,
         occurred_at: datetime,
         received_at: datetime,
-    ) -> tuple[KbEvent, bool]:
-        """Returns (row, created). created=False means idempotent duplicate."""
+        serialized_event: str,
+        initial_status: str = IngestionEventState.ACCEPTED.value,
+        flags: dict | None = None,
+    ) -> tuple[KbEvent, SubmitOutcome]:
+        """Atomic acceptance: ledger row + full envelope + job in ONE commit.
+
+        Returns (row, outcome). DUPLICATE = same key + same fingerprint.
+        CONFLICT = same key + different payload (caller surfaces 409).
+        """
+        fingerprint = request_fingerprint(serialized_event)
         async with self.cp.session() as s:
-            existing = await s.scalar(
-                select(KbEvent).where(KbEvent.idempotency_key == idempotency_key)
-            )
-            if existing is not None:
-                return existing, False
-            row = KbEvent(
-                event_id=event_id,
-                idempotency_key=idempotency_key,
-                schema_version=schema_version,
-                source_id=source_id,
-                source_revision=source_revision,
-                event_type=event_type,
-                namespace=namespace,
-                payload_reference=payload_reference,
-                content_hash=content_hash,
-                occurred_at=occurred_at,
-                received_at=received_at,
-                processing_status=IngestionEventState.ACCEPTED.value,
-            )
-            s.add(row)
-            await s.commit()
+            async with s.begin():
+                existing = await s.scalar(
+                    select(KbEvent).where(KbEvent.idempotency_key == idempotency_key)
+                )
+                if existing is not None:
+                    if existing.request_fingerprint == fingerprint:
+                        return existing, SubmitOutcome.DUPLICATE
+                    raise ConflictError(
+                        f"idempotency key '{idempotency_key}' was already used "
+                        "for a different payload"
+                    )
+                row = KbEvent(
+                    event_id=event_id,
+                    idempotency_key=idempotency_key,
+                    schema_version=schema_version,
+                    source_id=source_id,
+                    source_revision=source_revision,
+                    event_type=event_type,
+                    namespace=namespace,
+                    payload_reference=content_reference,
+                    event_payload=serialized_event,
+                    request_fingerprint=fingerprint,
+                    content_hash=content_hash,
+                    occurred_at=occurred_at,
+                    received_at=received_at,
+                    processing_status=initial_status,
+                    flags=flags or {},
+                )
+                s.add(row)
+                await s.flush()
+                s.add(KbIngestionJob(event_row_id=row.id, status="queued"))
+                await s.flush()
             await s.refresh(row)
-            return row, True
+            return row, SubmitOutcome.CREATED
 
     async def get_by_event_id(self, event_id: str) -> KbEvent | None:
         async with self.cp.session() as s:
@@ -118,13 +164,32 @@ class EventRepository:
             return await s.scalar(select(KbEvent).where(KbEvent.idempotency_key == key))
 
     async def set_status(self, event_row_id: str, target: IngestionEventState) -> None:
+        from ecosystem_kb.core.lifecycle import can_transition_ingestion
+
         async with self.cp.session() as s:
             row = await s.get(KbEvent, event_row_id)
             if row is None:
                 raise KeyError(event_row_id)
-            row.processing_status = transition_ingestion(
-                IngestionEventState(row.processing_status), target
-            ).value
+            current = IngestionEventState(row.processing_status)
+            # Tolerant under worker races: a same-state or already-advanced
+            # row is a no-op, not an error. Illegal BACKWARD moves still raise.
+            if current == target:
+                return
+            if not can_transition_ingestion(current, target):
+                # Another worker advanced it further; accept if terminal-bound.
+                if target in (
+                    IngestionEventState.GRAPH_WRITTEN,
+                    IngestionEventState.INDEX_VERIFIED,
+                    IngestionEventState.COMPLETED,
+                ) and current in (
+                    IngestionEventState.GRAPH_WRITTEN,
+                    IngestionEventState.INDEX_VERIFIED,
+                    IngestionEventState.COMPLETED,
+                ):
+                    return
+                row.processing_status = transition_ingestion(current, target).value
+            else:
+                row.processing_status = transition_ingestion(current, target).value
             await s.commit()
 
     async def force_status(self, event_row_id: str, target: IngestionEventState) -> None:
@@ -136,43 +201,126 @@ class EventRepository:
             row.processing_status = target.value
             await s.commit()
 
-    async def enqueue_job(self, event_row_id: str) -> KbIngestionJob:
-        async with self.cp.session() as s:
-            job = KbIngestionJob(event_row_id=event_row_id, status="queued")
-            s.add(job)
-            await s.commit()
-            await s.refresh(job)
-            return job
+    # -- job queue (Gate 2) ----------------------------------------------------
 
     async def claim_next_job(
         self, worker_id: str, lease_seconds: int = 300
     ) -> KbIngestionJob | None:
-        """Lease-based claim: oldest queued job, atomically marked processing."""
+        """Atomic claim.
+
+        1. Recover expired leases: processing jobs past lease_expires_at are
+           re-queued (crashed workers lose their jobs).
+        2. Claim the oldest visible queued job atomically via
+           UPDATE ... RETURNING. On Postgres the candidate CTE uses
+           FOR UPDATE SKIP LOCKED so competing workers never take the same
+           row; on SQLite single-writer transactions keep the claim atomic
+           for our test workloads.
+        """
+        now = datetime.now(UTC)
         async with self.cp.session() as s:
-            job = await s.scalar(
-                select(KbIngestionJob)
-                .where(KbIngestionJob.status == "queued")
-                .order_by(KbIngestionJob.id)
-                .limit(1)
-            )
-            if job is None:
-                return None
-            job.status = "processing"
-            job.worker_id = worker_id
-            job.attempt_count += 1
-            job.started_at = datetime.now(UTC)
-            job.lease_expires_at = datetime.now(UTC) + timedelta(
-                seconds=lease_seconds
+            # Lease-recovery sweep first (idempotent, cheap).
+            await s.execute(
+                update(KbIngestionJob)
+                .where(
+                    KbIngestionJob.status == "processing",
+                    KbIngestionJob.lease_expires_at.is_not(None),
+                    KbIngestionJob.lease_expires_at < now,
+                )
+                .values(
+                    status="queued",
+                    worker_id=None,
+                    lease_expires_at=None,
+                    next_attempt_at=now,
+                )
             )
             await s.commit()
+
+        is_pg = self.cp.engine.dialect.name == "postgresql"
+        if is_pg:
+            claim_sql = text(
+                """
+                WITH candidate AS (
+                    SELECT id FROM kb_ingestion_jobs
+                    WHERE status = 'queued' AND next_attempt_at <= :now
+                    ORDER BY created_at, id
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE kb_ingestion_jobs j
+                SET status = 'processing',
+                    worker_id = :worker_id,
+                    attempt_count = j.attempt_count + 1,
+                    started_at = :now,
+                    lease_expires_at = :lease_until
+                FROM candidate
+                WHERE j.id = candidate.id
+                RETURNING j.id
+                """
+            )
+            params = {
+                "now": now,
+                "worker_id": worker_id,
+                "lease_until": now + timedelta(seconds=lease_seconds),
+            }
+            async with self.cp.session() as s:
+                result = await s.execute(claim_sql, params)
+                job_id = result.scalar()
+                await s.commit()
+                if job_id is None:
+                    return None
+                return await s.get(KbIngestionJob, job_id)
+
+        # SQLite path: one transaction selects and flips the oldest job.
+        async with self.cp.session() as s:
+            async with s.begin():
+                job = (
+                    await s.execute(
+                        select(KbIngestionJob)
+                        .where(
+                            KbIngestionJob.status == "queued",
+                            KbIngestionJob.next_attempt_at <= now,
+                        )
+                        .order_by(KbIngestionJob.created_at, KbIngestionJob.id)
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                if job is None:
+                    return None
+                job.status = "processing"
+                job.worker_id = worker_id
+                job.attempt_count += 1
+                job.started_at = now
+                job.lease_expires_at = now + timedelta(seconds=lease_seconds)
             await s.refresh(job)
             return job
 
-    async def complete_job(self, job_id: str) -> None:
+    async def extend_lease(self, job_id: str, worker_id: str, lease_seconds: int = 300) -> bool:
+        """Heartbeat: only the owning worker can extend its lease."""
+        now = datetime.now(UTC)
         async with self.cp.session() as s:
-            await s.execute(
+            result = await s.execute(
                 update(KbIngestionJob)
-                .where(KbIngestionJob.id == job_id)
+                .where(
+                    KbIngestionJob.id == job_id,
+                    KbIngestionJob.worker_id == worker_id,
+                    KbIngestionJob.status == "processing",
+                )
+                .values(lease_expires_at=now + timedelta(seconds=lease_seconds))
+            )
+            await s.commit()
+            return result.rowcount > 0
+
+    async def complete_job(self, job_id: str, worker_id: str) -> bool:
+        """Ownership-guarded completion: a stale worker cannot complete a job
+        that was recovered and finished by someone else."""
+        async with self.cp.session() as s:
+            result = await s.execute(
+                update(KbIngestionJob)
+                .where(
+                    KbIngestionJob.id == job_id,
+                    KbIngestionJob.worker_id == worker_id,
+                    KbIngestionJob.status == "processing",
+                )
                 .values(
                     status="completed",
                     completed_at=datetime.now(UTC),
@@ -180,24 +328,41 @@ class EventRepository:
                 )
             )
             await s.commit()
+            return result.rowcount > 0
 
     async def fail_job(
-        self, job_id: str, error: str, retryable: bool, max_attempts: int = 5
+        self,
+        job_id: str,
+        worker_id: str,
+        error: str,
+        retryable: bool,
+        max_attempts: int = 5,
+        base_backoff_seconds: float = 2.0,
     ) -> str:
-        """Returns 'requeued' | 'failed_final'."""
+        """Ownership-guarded failure. Returns 'requeued' | 'dead_letter' | 'lost_ownership'.
+
+        Exponential backoff: attempt n waits base * 2^(n-1) seconds.
+        Exhausted or non-retryable jobs go to 'dead_letter' (distinct from
+        'failed'), surfaced by ops tooling.
+        """
         async with self.cp.session() as s:
             job = await s.get(KbIngestionJob, job_id)
             if job is None:
                 raise KeyError(job_id)
+            if job.worker_id != worker_id or job.status != "processing":
+                return "lost_ownership"
             job.last_error = error[-2000:]
             if retryable and job.attempt_count < max_attempts:
                 job.status = "queued"
+                backoff = base_backoff_seconds * (2 ** (job.attempt_count - 1))
+                job.next_attempt_at = datetime.now(UTC) + timedelta(seconds=backoff)
                 job.lease_expires_at = None
+                job.worker_id = None
                 outcome = "requeued"
             else:
-                job.status = "failed"
+                job.status = "dead_letter"
                 job.lease_expires_at = None
-                outcome = "failed_final"
+                outcome = "dead_letter"
             await s.commit()
             return outcome
 
@@ -232,7 +397,11 @@ class IdentityRepository:
         self.cp = cp
 
     async def upsert_identity(
-        self, canonical_key: str, entity_type: str, canonical_name: str, graphiti_uuid: str | None = None
+        self,
+        canonical_key: str,
+        entity_type: str,
+        canonical_name: str,
+        graphiti_uuid: str | None = None,
     ) -> KbEntityIdentity:
         async with self.cp.session() as s:
             row = await s.scalar(
@@ -294,7 +463,6 @@ class IdentityRepository:
             return list(res)
 
     async def find_by_name(self, name: str) -> list[KbEntityIdentity]:
-        """All identities whose canonical name or alias matches (ambiguity check)."""
         async with self.cp.session() as s:
             by_name = await s.scalars(
                 select(KbEntityIdentity).where(KbEntityIdentity.canonical_name == name)
@@ -360,9 +528,16 @@ class ClientRepository:
         self.cp = cp
 
     async def register(
-        self, client_id: str, client_name: str, scopes: list[str], allowed_namespaces: list[str]
+        self,
+        client_id: str,
+        client_name: str,
+        scopes: list[str],
+        allowed_namespaces: list[str],
+        allowed_sources: list[str] | None = None,
     ) -> str:
-        """Creates the client and returns the plaintext token ONCE."""
+        """Creates the client and returns the plaintext token ONCE.
+        allowed_sources: source_ids this client may submit on behalf of;
+        ['*'] means any (legacy/dev clients only)."""
         token = secrets.token_urlsafe(32)
         async with self.cp.session() as s:
             s.add(
@@ -372,6 +547,7 @@ class ClientRepository:
                     token_hash=hash_token(token),
                     scopes=scopes,
                     allowed_namespaces=allowed_namespaces,
+                    allowed_sources=allowed_sources or ["*"],
                 )
             )
             await s.commit()
@@ -430,6 +606,130 @@ class ReviewRepository:
             return row
 
 
+class MaintenanceRepository:
+    """Durable maintenance proposals (Gate 4): everything survives restarts."""
+
+    def __init__(self, cp: ControlPlane) -> None:
+        self.cp = cp
+
+    async def upsert_action(self, action: dict) -> KbMaintenanceAction:
+        async with self.cp.session() as s:
+            row = await s.get(KbMaintenanceAction, action["action_id"])
+            if row is None:
+                row = KbMaintenanceAction(**action)
+                s.add(row)
+            else:
+                # Immutable once reviewed: a stale re-proposal cannot
+                # overwrite a decision in flight.
+                if (
+                    row.proposal_version != action["proposal_version"]
+                    and row.approval_status != "pending"
+                ):
+                    raise ConflictError(
+                        f"action {action['action_id']} changed after review; "
+                        "re-propose under a new action id"
+                    )
+                if row.approval_status == "pending":
+                    for k in ("candidates", "evidence", "reason", "risk_level", "reversibility"):
+                        if k in action:
+                            setattr(row, k, action[k])
+                row.updated_at = datetime.now(UTC)
+            await s.commit()
+            await s.refresh(row)
+            return row
+
+    async def get(self, action_id: str) -> KbMaintenanceAction | None:
+        async with self.cp.session() as s:
+            return await s.get(KbMaintenanceAction, action_id)
+
+    async def decide(
+        self, action_id: str, decision: str, reviewer: str, reason: str
+    ) -> KbMaintenanceAction:
+        async with self.cp.session() as s:
+            row = await s.get(KbMaintenanceAction, action_id)
+            if row is None:
+                raise KeyError(action_id)
+            if row.approval_status != "pending":
+                raise ConflictError(f"action {action_id} already {row.approval_status}")
+            row.approval_status = decision
+            row.reviewer = reviewer
+            row.reviewed_at = datetime.now(UTC)
+            row.review_reason = reason
+            row.updated_at = datetime.now(UTC)
+            await s.commit()
+            await s.refresh(row)
+            return row
+
+    async def begin_apply(self, action_id: str, operator: str) -> KbMaintenanceAction:
+        async with self.cp.session() as s:
+            row = await s.get(KbMaintenanceAction, action_id)
+            if row is None:
+                raise KeyError(action_id)
+            row.apply_attempts += 1
+            row.execution_status = "running"
+            row.executed_by = operator
+            row.updated_at = datetime.now(UTC)
+            await s.commit()
+            await s.refresh(row)
+            return row
+
+    async def finish_apply(self, action_id: str, status: str) -> KbMaintenanceAction:
+        async with self.cp.session() as s:
+            row = await s.get(KbMaintenanceAction, action_id)
+            if row is None:
+                raise KeyError(action_id)
+            row.execution_status = status
+            if status == "completed":
+                row.executed_at = datetime.now(UTC)
+            row.updated_at = datetime.now(UTC)
+            await s.commit()
+            await s.refresh(row)
+            return row
+
+
+class ProvenanceRepository:
+    """kb_provenance_links: the retrievable provenance index (Gate 4)."""
+
+    def __init__(self, cp: ControlPlane) -> None:
+        self.cp = cp
+
+    async def record_batch(self, links: list[dict]) -> int:
+        if not links:
+            return 0
+        async with self.cp.session() as s:
+            for payload in links:
+                s.add(KbProvenanceLink(**payload))
+            await s.commit()
+        return len(links)
+
+    async def for_edge(self, edge_uuid: str) -> list[KbProvenanceLink]:
+        async with self.cp.session() as s:
+            res = await s.scalars(
+                select(KbProvenanceLink)
+                .where(KbProvenanceLink.edge_uuid == edge_uuid)
+                .order_by(KbProvenanceLink.occurred_at)
+            )
+            return list(res)
+
+    async def for_entity(self, entity_uuid: str) -> list[KbProvenanceLink]:
+        async with self.cp.session() as s:
+            res = await s.scalars(
+                select(KbProvenanceLink)
+                .where(KbProvenanceLink.entity_uuid == entity_uuid)
+                .order_by(KbProvenanceLink.occurred_at)
+            )
+            return list(res)
+
+    async def for_event(self, event_id: str) -> list[KbProvenanceLink]:
+        async with self.cp.session() as s:
+            res = await s.scalars(
+                select(KbProvenanceLink)
+                .where(KbProvenanceLink.event_id == event_id)
+                .order_by(KbProvenanceLink.occurred_at)
+            )
+            return list(res)
+
+
 class Repositories:
     """Bundle passed around services."""
 
@@ -441,3 +741,5 @@ class Repositories:
         self.audit = AuditRepository(cp)
         self.clients = ClientRepository(cp)
         self.reviews = ReviewRepository(cp)
+        self.maintenance = MaintenanceRepository(cp)
+        self.provenance = ProvenanceRepository(cp)

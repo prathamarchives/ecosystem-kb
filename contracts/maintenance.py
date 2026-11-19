@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class MaintenanceOperation(str, Enum):
+class MaintenanceOperation(StrEnum):
     SCHEMA_VALIDATION = "schema_validation"
     DUPLICATE_EVENT_REJECTION = "duplicate_event_rejection"
     ALIAS_CANDIDATE_DISCOVERY = "alias_candidate_discovery"
@@ -27,26 +27,26 @@ class MaintenanceOperation(str, Enum):
     KNOWLEDGE_COMPACTION = "knowledge_compaction"
 
 
-class RiskLevel(str, Enum):
+class RiskLevel(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
 
 
-class Reversibility(str, Enum):
+class Reversibility(StrEnum):
     REVERSIBLE = "reversible"
     REVERSIBLE_WITH_EFFORT = "reversible_with_effort"
     IRREVERSIBLE = "irreversible"
 
 
-class ApprovalStatus(str, Enum):
+class ApprovalStatus(StrEnum):
     PENDING = "pending"
     APPROVED = "approved"
     REJECTED = "rejected"
     EXPIRED = "expired"
 
 
-class ExecutionStatus_(str, Enum):
+class ExecutionStatus_(StrEnum):
     NOT_STARTED = "not_started"
     RUNNING = "running"
     COMPLETED = "completed"

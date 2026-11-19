@@ -94,7 +94,7 @@ class DeterministicEmbedder(EmbedderClient):
 
 class DeterministicReranker(CrossEncoderClient):
     async def rank(self, query: str, passages: list[str]) -> list[tuple[str, float]]:
-        return list(zip(passages, [1.0] * len(passages)))
+        return list(zip(passages, [1.0] * len(passages), strict=True))
 
 
 class MarkerExtractionLLM(LLMClient):
@@ -110,9 +110,13 @@ class MarkerExtractionLLM(LLMClient):
             return {}
 
         model_name = getattr(response_model, "__name__", "")
-        props = response_model.model_json_schema().get("properties", {})
         payload = _payload_from(messages)
 
+        if model_name == "CombinedExtraction":
+            # Bulk path (one call for entities + edges together).
+            entities = payload.get("entities", []) if payload else []
+            edges = payload.get("edges", []) if payload else []
+            return {"extracted_entities": entities, "edges": edges}
         if model_name == "ExtractedEntities":
             entities = payload.get("entities", []) if payload else []
             return {"extracted_entities": entities}

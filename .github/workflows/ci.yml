@@ -1,14 +1,51 @@
 name: CI
+
 on:
-  push: {branches: [main]}
+  push:
+    branches: [main, "repair/**"]
   pull_request:
+
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: {python-version: "3.12"}
-      - run: pip install -e ".[dev,embedded]"
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
       - run: ruff check .
-      - run: pytest -q
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: pytest tests/unit -q
+
+  embedded-integration:
+    # Real FalkorDB engine via falkordblite (no docker-in-docker needed).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev,embedded]"
+      - run: pytest tests/integration/test_vertical_slice.py tests/integration/test_fault_injection.py tests/contract -q
+      - run: pytest tests/security -q
+
+  postgres-integration:
+    # Real PostgreSQL via pgserver; exercises migrations, atomic submit,
+    # SKIP LOCKED claiming, and the production control-plane path.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: pytest tests/integration/test_postgres.py -q

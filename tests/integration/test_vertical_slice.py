@@ -142,9 +142,8 @@ class TestVerticalSlice:
         )
         assert receipt.status == "queued"
 
-        row = await control_plane.events.get_by_event_id(str(event.event_id))
-        await services.store_event_payload(row.id, event)
-
+        # The envelope was persisted atomically at submit; the worker needs
+        # no extra step — this is exactly what the review asked to verify.
         worker = IngestionWorker(services)
         processed = await worker.run_once()
         assert processed == 1

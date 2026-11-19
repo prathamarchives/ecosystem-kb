@@ -7,7 +7,7 @@ client; callers never choose group_ids (SYS-S-003).
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -29,7 +29,7 @@ ROLE_SCOPES: dict[str, list[str]] = {
 }
 
 
-class AuthzAction(str, Enum):
+class AuthzAction(StrEnum):
     SEARCH = "search"
     SUBMIT_EVENT = "submit_event"
     GET_ENTITY = "get_entity"
@@ -69,6 +69,13 @@ class ClientRegistration(BaseModel):
     allowed_namespaces: list[str] = Field(
         description="Server-enforced namespaces this client may touch"
     )
+    allowed_sources: list[str] = Field(
+        default_factory=lambda: ["*"],
+        description="Source system IDs this client may submit on behalf of",
+    )
+    default_namespace: str | None = Field(
+        default=None, description="Explicit default; must be within allowed_namespaces"
+    )
     status: str = "active"
 
 
@@ -89,17 +96,27 @@ class AuthenticatedClient(BaseModel):
     client_id: str
     scopes: list[str]
     allowed_namespaces: list[str]
+    allowed_sources: list[str] = Field(default_factory=lambda: ["*"])
+    default_namespace: str | None = None
     status: str = "active"
 
-    @property
-    def default_namespace(self) -> str:
-        return self.allowed_namespaces[0] if self.allowed_namespaces else "ecosystem-prod"
+    def resolved_namespace(self, settings_default: str) -> str:
+        """Explicit default wins; else first allowed; must be a member."""
+        ns = self.default_namespace or (
+            self.allowed_namespaces[0] if self.allowed_namespaces else settings_default
+        )
+        return ns
 
     def can(self, action: AuthzAction) -> bool:
         return ACTION_SCOPES[action] in self.scopes
 
     def namespace_allowed(self, namespace: str) -> bool:
         return namespace in self.allowed_namespaces
+
+    def may_submit_for_source(self, source_id: str) -> bool:
+        """Source-ownership boundary (review P1): clients may only submit
+        events on behalf of sources they own. '*' is dev/legacy only."""
+        return "*" in self.allowed_sources or source_id in self.allowed_sources
 
 
 def utcnow() -> datetime:

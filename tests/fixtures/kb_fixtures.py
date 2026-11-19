@@ -57,7 +57,16 @@ async def services(embedded_graph, control_plane):
     settings = KbSettings(
         graph_database="test_ns",
         llm_provider="fake",
+        default_namespace="ecosystem-dev",
         allowed_namespaces="ecosystem-dev,ecosystem-test,ecosystem-prod",
+    )
+    # The source-ownership boundary is real: register the test producer.
+    await control_plane.sources.upsert(
+        source_id="system:arivoo",
+        canonical_uri="arivoo://",
+        source_type="note",
+        owner_system="system:arivoo",
+        trust_class="system_generated",
     )
     yield KbServices(control_plane, embedded_graph, settings)
 

@@ -9,13 +9,14 @@ dependencies = [
     "graphiti-core==0.31.2",
     "falkordb>=1.8.2",
     "fastmcp==4.2.1",
-    "fastapi>=0.129",
-    "uvicorn>=0.37",
-    "sqlalchemy>=2.0",
-    "aiosqlite>=0.21",
-    "pydantic>=2.11",
-    "pydantic-settings>=2.12",
-    "httpx>=0.29",
+    "fastapi>=0.129,<0.130",
+    "uvicorn>=0.37,<1.0",
+    "sqlalchemy>=2.0,<2.1",
+    "aiosqlite>=0.21,<0.22",
+    "asyncpg>=0.30,<0.31",
+    "pydantic>=2.11,<3",
+    "pydantic-settings>=2.12,<3",
+    "httpx>=0.29,<0.30",
 ]
 
 [project.optional-dependencies]
@@ -23,7 +24,8 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=1.0",
     "ruff>=0.7",
-    "asyncpg>=0.30",
+    "psycopg[binary]>=3.2",
+    "pgserver>=0.1.4",
 ]
 embedded = [
     # falkordblite provides redis-server + falkordb.so for embedded testing
@@ -46,6 +48,7 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "embedded: tests that boot an embedded FalkorDB server (need falkordblite)",
+    "postgres: tests against a real PostgreSQL server (need pgserver)",
 ]
 filterwarnings = ["ignore::DeprecationWarning"]
 
@@ -57,3 +60,7 @@ src = ["src", "ontology", "contracts", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# FastAPI's Depends() in defaults is the framework idiom, not a bug.
+"src/ecosystem_kb/api/**" = ["B008"]

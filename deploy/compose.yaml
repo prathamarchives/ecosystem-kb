@@ -11,6 +11,9 @@ services:
       KB_GRAPH_PASSWORD: ${FALKORDB_PASSWORD}
       KB_GRAPH_DATABASE: ${KB_NAMESPACE:-ecosystem_prod}
       KB_API_TOKENS: ${KB_API_TOKENS}
+      KB_DEFAULT_NAMESPACE: ${KB_NAMESPACE:-ecosystem_prod}
+      KB_ALLOWED_NAMESPACES: ${KB_NAMESPACE:-ecosystem_prod}
+      KB_ENVIRONMENT: ${KB_ENVIRONMENT:-production}
       KB_LLM_PROVIDER: ${KB_LLM_PROVIDER:-openai}
       KB_LLM_MODEL: ${KB_LLM_MODEL}
       KB_LLM_API_KEY: ${KB_LLM_API_KEY}
@@ -35,7 +38,7 @@ services:
     command: kb worker
 
   falkordb:
-    image: falkordb/falkordb:latest
+    image: falkordb/falkordb:4.22.1
     environment:
       FALKORDB_PASSWORD: ${FALKORDB_PASSWORD}
     volumes:

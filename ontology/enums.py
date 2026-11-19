@@ -4,10 +4,10 @@ Every enum here is part of the versioned ontology (LAW-006): values are
 added, never silently renamed or removed. See ontology/versions.py.
 """
 
-from enum import Enum
+from enum import StrEnum
 
 
-class SystemKind(str, Enum):
+class SystemKind(StrEnum):
     APPLICATION = "application"
     AGENT = "agent"
     SERVICE = "service"
@@ -18,7 +18,7 @@ class SystemKind(str, Enum):
     RESEARCH_ENVIRONMENT = "research_environment"
 
 
-class LifecycleStatus(str, Enum):
+class LifecycleStatus(StrEnum):
     PLANNED = "planned"
     ACTIVE = "active"
     MAINTENANCE = "maintenance"
@@ -26,7 +26,7 @@ class LifecycleStatus(str, Enum):
     RETIRED = "retired"
 
 
-class ComponentKind(str, Enum):
+class ComponentKind(StrEnum):
     MODULE = "module"
     SUBSYSTEM = "subsystem"
     LIBRARY = "library"
@@ -35,7 +35,7 @@ class ComponentKind(str, Enum):
     INTERFACE_BOUNDARY = "interface_boundary"
 
 
-class InterfaceKind(str, Enum):
+class InterfaceKind(StrEnum):
     REST = "rest"
     MCP = "mcp"
     CLI = "cli"
@@ -46,7 +46,7 @@ class InterfaceKind(str, Enum):
     INTERNAL_API = "internal_api"
 
 
-class ArtifactKind(str, Enum):
+class ArtifactKind(StrEnum):
     REPOSITORY = "repository"
     DOCUMENT = "document"
     SPECIFICATION = "specification"
@@ -57,7 +57,7 @@ class ArtifactKind(str, Enum):
     SCHEMA = "schema"
 
 
-class TrustClass(str, Enum):
+class TrustClass(StrEnum):
     """Origin classification — describes where content came from, not how true it is."""
 
     HUMAN_AUTHORED = "human_authored"
@@ -69,14 +69,14 @@ class TrustClass(str, Enum):
     SYSTEM_GENERATED = "system_generated"
 
 
-class AccessClass(str, Enum):
+class AccessClass(StrEnum):
     PUBLIC = "public"
     INTERNAL = "internal"
     PRIVATE = "private"
     CONFIDENTIAL = "confidential"
 
 
-class RequirementKind(str, Enum):
+class RequirementKind(StrEnum):
     STAKEHOLDER = "stakeholder"
     FUNCTIONAL = "functional"
     NON_FUNCTIONAL = "non_functional"
@@ -87,7 +87,7 @@ class RequirementKind(str, Enum):
     RELIABILITY = "reliability"
 
 
-class RequirementStatus(str, Enum):
+class RequirementStatus(StrEnum):
     PROPOSED = "proposed"
     ACCEPTED = "accepted"
     IMPLEMENTED = "implemented"
@@ -96,7 +96,7 @@ class RequirementStatus(str, Enum):
     REJECTED = "rejected"
 
 
-class DecisionStatus(str, Enum):
+class DecisionStatus(StrEnum):
     PROPOSED = "proposed"
     ACCEPTED = "accepted"
     SUPERSEDED = "superseded"
@@ -104,7 +104,7 @@ class DecisionStatus(str, Enum):
     UNDER_REVIEW = "under_review"
 
 
-class ClaimKind(str, Enum):
+class ClaimKind(StrEnum):
     OBSERVATION = "observation"
     REPORTED_CLAIM = "reported_claim"
     INFERENCE = "inference"
@@ -113,7 +113,7 @@ class ClaimKind(str, Enum):
     FINDING = "finding"
 
 
-class EpistemicStatus(str, Enum):
+class EpistemicStatus(StrEnum):
     ESTABLISHED_WITHIN_SCOPE = "established_within_scope"
     SUPPORTED = "supported"
     PROVISIONAL = "provisional"
@@ -121,14 +121,14 @@ class EpistemicStatus(str, Enum):
     RETRACTED = "retracted"
 
 
-class ReviewStatus(str, Enum):
+class ReviewStatus(StrEnum):
     UNREVIEWED = "unreviewed"
     REVIEWED = "reviewed"
     APPROVED = "approved"
     REJECTED = "rejected"
 
 
-class ExecutionStatus(str, Enum):
+class ExecutionStatus(StrEnum):
     NOT_STARTED = "not_started"
     RUNNING = "running"
     COMPLETED = "completed"
@@ -136,7 +136,7 @@ class ExecutionStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
-class FindingKind(str, Enum):
+class FindingKind(StrEnum):
     EMPIRICAL = "empirical"
     THEORETICAL = "theoretical"
     COMPUTATIONAL = "computational"
@@ -145,7 +145,7 @@ class FindingKind(str, Enum):
     OPERATIONAL = "operational"
 
 
-class ProjectKind(str, Enum):
+class ProjectKind(StrEnum):
     PRODUCT = "product"
     RESEARCH = "research"
     INFRASTRUCTURE = "infrastructure"
@@ -153,7 +153,7 @@ class ProjectKind(str, Enum):
     EDUCATION = "education"
 
 
-class ProjectStatus(str, Enum):
+class ProjectStatus(StrEnum):
     PROPOSED = "proposed"
     ACTIVE = "active"
     PAUSED = "paused"
@@ -166,7 +166,7 @@ class ProjectStatus(str, Enum):
 # ---------------------------------------------------------------------------
 
 
-class VariableKind(str, Enum):
+class VariableKind(StrEnum):
     CONFIGURATION = "configuration"
     DESIGN_PARAMETER = "design_parameter"
     MODEL_PARAMETER = "model_parameter"
@@ -176,7 +176,7 @@ class VariableKind(str, Enum):
     DATASET_FIELD = "dataset_field"
 
 
-class VariableDataType(str, Enum):
+class VariableDataType(StrEnum):
     STRING = "string"
     INTEGER = "integer"
     NUMBER = "number"
@@ -191,7 +191,7 @@ class VariableDataType(str, Enum):
     SERIES_REFERENCE = "series_reference"
 
 
-class VariableScope(str, Enum):
+class VariableScope(StrEnum):
     ECOSYSTEM = "ecosystem"
     PROJECT = "project"
     SYSTEM = "system"
@@ -202,7 +202,7 @@ class VariableScope(str, Enum):
     DATASET = "dataset"
 
 
-class VariableMutability(str, Enum):
+class VariableMutability(StrEnum):
     IMMUTABLE = "immutable"
     CONFIGURATION_CONTROLLED = "configuration_controlled"
     OPERATOR_CONTROLLED = "operator_controlled"
@@ -211,14 +211,14 @@ class VariableMutability(str, Enum):
     EXTERNALLY_UPDATED = "externally_updated"
 
 
-class VariableSensitivity(str, Enum):
+class VariableSensitivity(StrEnum):
     PUBLIC = "public"
     INTERNAL = "internal"
     SENSITIVE = "sensitive"
     # NOTE: no 'secret' level — secrets never enter the graph (LAW-010)
 
 
-class SourceKind(str, Enum):
+class SourceKind(StrEnum):
     NOTE = "note"
     REPOSITORY = "repository"
     DOCUMENT = "document"
@@ -231,7 +231,7 @@ class SourceKind(str, Enum):
     WEB_PAGE = "web_page"
 
 
-class EvidenceStatus(str, Enum):
+class EvidenceStatus(StrEnum):
     """Evidence classification for extracted/derived knowledge (spec §4)."""
 
     OBSERVED = "observed"

@@ -16,27 +16,32 @@ router = APIRouter(tags=["events"])
 @router.post(
     "/events",
     response_model=EventReceipt,
-    responses={422: {"model": ErrorBody}, 401: {"model": ErrorBody}, 403: {"model": ErrorBody}},
+    responses={
+        409: {"model": ErrorBody},
+        422: {"model": ErrorBody},
+        401: {"model": ErrorBody},
+        403: {"model": ErrorBody},
+    },
 )
-async def submit_event(request: Request, event: KnowledgeEvent, _client=Depends(authenticated_client)) -> EventReceipt:
+async def submit_event(
+    request: Request,
+    event: KnowledgeEvent,
+    _client=Depends(authenticated_client),
+) -> EventReceipt:
     services = request.app.state.services
     client = request.state.client
-    receipt = await services.submit_event(client, event)
-    # Persist the envelope for the worker before returning the receipt.
-    row = await services.repos.events.get_by_event_id(str(event.event_id))
-    if row is not None and not receipt.duplicate:
-        await services.store_event_payload(row.id, event)
-    return receipt
+    # Submit is atomic: ledger row + serialized envelope + job in ONE
+    # transaction; no post-return persistence step exists to forget.
+    return await services.submit_event(client, event)
 
 
 @router.get("/events/{event_id}")
-async def event_status(request: Request, event_id: UUID, _client=Depends(authenticated_client)):
+async def event_status(
+    request: Request, event_id: UUID, _client=Depends(authenticated_client)
+):
     services = request.app.state.services
     client = request.state.client
-    try:
-        row = await services.event_status(client, str(event_id))
-    except Exception as exc:  # surfaced uniformly
-        return error_response(exc)
+    row = await services.event_status(client, str(event_id))
     return {
         "event_id": row.event_id,
         "idempotency_key": row.idempotency_key,

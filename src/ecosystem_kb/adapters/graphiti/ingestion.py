@@ -1,9 +1,22 @@
-"""Ingestion into the graph: episode creation + ontology gate + identity sync.
+"""Ingestion into the graph: extraction proposals → ontology gate → commit.
 
-The write path (spec §18.1): the worker calls ingest_event; extraction runs
-(proposal); every extracted edge passes the ontology registry (LAW-006) —
-valid ones commit, unknown ones are quarantined and review-queued, never
-silently admitted. Canonical identities sync to the control plane (LAW-005).
+Gate 3 (review P1) — the pre-commit ontology gate. Graphiti's add_episode
+extracts AND writes in one call; it cannot validate-before-commit. So the
+adapter enforces the ontology on BOTH sides of that call:
+
+  BEFORE: the episode body is composed with strict_edge_types=True so
+  graphiti itself only keeps edges whose (source labels, relation, target
+  labels) signature appears in our edge_type_map (enforced by
+  enforce_edge_type_signatures — mismatches are DROPPED, not renamed).
+
+  AFTER: every returned edge is re-validated against the registry by its
+  actual relation name and endpoint labels. Anything that is not a known
+  canonical relation — including graphiti's RELATES_TO fallback — is
+  quarantined: recorded in the review queue, excluded from counts, and
+  (best-effort) deleted from the graph so canonical search stays clean.
+
+The episode node remains as evidence (LAW-002); invalid RELATIONSHIPS never
+enter the canonical edge set (LAW-006).
 """
 
 from __future__ import annotations
@@ -27,6 +40,10 @@ class IngestionOutcome:
     edges_quarantined: list = field(default_factory=list)
     identities_registered: list[str] = field(default_factory=list)
     flags: list[str] = field(default_factory=list)
+    # References for provenance recording (Gate 4): the actual written
+    # objects, so the caller can link edge/entity uuids to the event.
+    edges_written_refs: list = field(default_factory=list)
+    entities_written_refs: list[str] = field(default_factory=list)
 
 
 def _episode_body(event: KnowledgeEvent) -> str:
@@ -44,49 +61,61 @@ def _source_description(event: KnowledgeEvent) -> str:
     )
 
 
+def _node_entity_type(node, entity_types: dict) -> str | None:
+    for label in getattr(node, "labels", None) or []:
+        if label in entity_types and label != "Entity":
+            return label
+    return None
+
+
 async def ingest_event(
     graphiti: Graphiti,
     event: KnowledgeEvent,
     namespace: str,
     identity_sync=None,
 ) -> IngestionOutcome:
-    """Run one event through Graphiti with our ontology as the type system.
-
-    identity_sync: optional async callable (canonical_key, entity_type, name,
-    graphiti_uuid) used to keep the control-plane registry in step.
-    """
+    """Run one event through Graphiti with the ontology enforced around the
+    write (see module docstring). identity_sync: optional callable
+    (canonical_key, entity_type, name, graphiti_uuid), sync or async."""
     entity_types = REGISTRY.graphiti_entity_types()
     edge_types = REGISTRY.graphiti_edge_types()
     edge_type_map = REGISTRY.graphiti_edge_type_map()
 
-    results = await graphiti.add_episode(
+    # add_episode_bulk is the API that exposes strict_edge_types (0.31.2):
+    # extracted edges that do not use one of our canonical edge types are
+    # DROPPED by graphiti before commit — the pre-commit ontology gate.
+    from graphiti_core.nodes import EpisodeType
+    from graphiti_core.utils.bulk_utils import RawEpisode
+
+    raw = RawEpisode(
         name=f"{event.event_type}:{event.idempotency_key}",
-        episode_body=_episode_body(event),
+        content=_episode_body(event),
         source_description=_source_description(event),
+        source=EpisodeType.text,
         reference_time=event.timestamps.occurred_at,
+    )
+    results = await graphiti.add_episode_bulk(
+        [raw],
         group_id=namespace,
         entity_types=entity_types,
         edge_types=edge_types,
         edge_type_map=edge_type_map,
+        strict_edge_types=True,
     )
 
     outcome = IngestionOutcome(event_row_id="")
-    outcome.episode_uuid = str(getattr(results, "episode_uuid", "") or "") or None
+    episodes = getattr(results, "episodes", None) or []
+    outcome.episode_uuid = str(episodes[0].uuid) if episodes else None
     outcome.entities_written = len(results.nodes)
-    outcome.edges_written = len(results.edges)
 
     # Identity sync: register every written node under its canonical key.
     for node in results.nodes:
-        labels = list(getattr(node, "labels", None) or [])
-        entity_type = None
-        for label in labels:
-            if label in entity_types and label != "Entity":
-                entity_type = label
-                break
+        entity_type = _node_entity_type(node, entity_types)
         canonical_name = node.name
         type_prefix = _prefix_for(entity_type) if entity_type else "concept"
         canonical_key = f"{type_prefix}:{canonical_name.strip().lower().replace(' ', '-')}"
         outcome.identities_registered.append(canonical_key)
+        outcome.entities_written_refs.append(str(node.uuid))
         if identity_sync is not None:
             result = identity_sync(
                 canonical_key, entity_type or "Concept", canonical_name, str(node.uuid)
@@ -94,14 +123,19 @@ async def ingest_event(
             if hasattr(result, "__await__"):
                 await result
 
-    # Ontology gate on edges (LAW-006): unknown relation or bad domain/range
-    # must be surfaced, not buried. Graphiti already filtered what it could
-    # via edge_type_map; anything that still arrived as an unmapped predicate
-    # is quarantined here.
+    # Post-write ontology gate (LAW-006): every returned edge must carry a
+    # CANONICAL relation name AND a valid (source, relation, target) type
+    # triple. RELATES_TO is graphiti's fallback for unmapped predicates —
+    # it is never a canonical fact, so it is quarantined and removed.
+    vocabulary = set(REGISTRY.relationship_names)
     for edge in results.edges:
         relation = edge.name.upper()
-        if relation not in REGISTRY.relationship_names:
-            q = REGISTRY.quarantine_edge(
+        if relation in vocabulary and _edge_domain_range_ok(edge, relation):
+            outcome.edges_written += 1
+            outcome.edges_written_refs.append(edge)
+            continue
+        outcome.edges_quarantined.append(
+            REGISTRY.quarantine_edge(
                 relation=relation,
                 source_type="Unknown",
                 target_type="Unknown",
@@ -109,9 +143,38 @@ async def ingest_event(
                 target_name=str(getattr(edge, "target_node_uuid", "")),
                 fact=edge.fact,
             )
-            outcome.edges_quarantined.append(q)
-    outcome.edges_written -= len(outcome.edges_quarantined)
+        )
+        await _delete_edge_best_effort(graphiti, namespace, edge)
+
     return outcome
+
+
+def _edge_domain_range_ok(edge, relation: str) -> bool:
+    """Validate the actual endpoint labels of a written edge (Gate 3)."""
+    labels = list(getattr(edge, "source_node_labels", None) or [])
+    if not labels:
+        return True  # labels unavailable on this edge object; name check only
+    return any(
+        REGISTRY.validate_relationship(relation, s, t) is not None
+        for s in _non_generic(labels)
+        for t in _non_generic(list(getattr(edge, "target_node_labels", None) or ["Entity"]))
+    )
+
+
+def _non_generic(labels: list[str]) -> list[str]:
+    return [label for label in labels if label != "Entity"] or ["Entity"]
+
+
+async def _delete_edge_best_effort(graphiti: Graphiti, namespace: str, edge) -> None:
+    """Compensation: remove a non-canonical edge from the graph. The
+    quarantine record in the review queue preserves the evidence."""
+    try:
+        from graphiti_core.edges import EntityEdge
+
+        if isinstance(edge, EntityEdge):
+            await edge.delete(graphiti.driver)
+    except Exception:  # noqa: BLE001 — compensation must never break ingestion
+        pass
 
 
 def provenance_for(event: KnowledgeEvent, episode_uuid: str | None) -> ProvenanceRecord:

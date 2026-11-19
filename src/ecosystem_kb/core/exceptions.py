@@ -27,6 +27,13 @@ class DuplicateEventError(KbError):
     error_code = "duplicate_event"
 
 
+class ConflictError(KbError):
+    """Same idempotency key, different payload (Gate 1: 409, not silent dup)."""
+
+    status_code = 409
+    error_code = "idempotency_conflict"
+
+
 class AuthenticationError(KbError):
     status_code = 401
     error_code = "unauthenticated"

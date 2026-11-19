@@ -9,10 +9,10 @@ Both are enforced here, deterministically — the only path for transitions.
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 
 
-class IngestionEventState(str, Enum):
+class IngestionEventState(StrEnum):
     RECEIVED = "received"
     VALIDATING = "validating"
     REJECTED = "rejected"
@@ -80,7 +80,7 @@ TERMINAL_INGESTION_STATES = {
 }
 
 
-class ReviewState(str, Enum):
+class ReviewState(StrEnum):
     UNREVIEWED = "unreviewed"
     REVIEWED = "reviewed"
     APPROVED = "approved"

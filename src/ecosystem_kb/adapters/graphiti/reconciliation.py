@@ -108,7 +108,6 @@ async def find_contradictions_for(graphiti: Graphiti, namespace: str, edges) -> 
             contradictions.append(edge.fact)
             continue
         key = (source or "?", relation)
-        fact_key = (key[0], key[1], edge.fact)
         if key in seen_predicates and seen_predicates[key] != edge.fact:
             contradictions.append(f"conflicting facts about {key[0]} ({key[1]})")
         seen_predicates.setdefault(key, edge.fact)

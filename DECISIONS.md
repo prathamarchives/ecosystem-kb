@@ -104,3 +104,45 @@ input — graphiti passes `[query]`).
 graphiti_uuid → source_references → aliases` maintained in the control plane;
 graph UUIDs are storage details, not identity. **Rationale:** LAW-005; renames
 must not create entities; merges preserve aliases.
+
+---
+
+## Repair branch (2026-11-19, post-review of b7cbe39)
+
+## ADR-013 · ENTITY_MERGE is a registry merge, not a graph merge
+**Status:** Accepted (2026-11-19). **Decision:** the maintenance ENTITY_MERGE
+operation merges control-plane identities: candidate canonical keys are
+marked `merged`, their aliases re-point to the target, audit records are
+written. Graphiti nodes/edges are NOT rewritten — the graph keeps both
+nodes, and alias-level identity resolution happens through the registry
+(ADR-012). **Rationale:** honest naming over implied capability; a graph
+merge that rewrote edges/provenance would need its own provenance model
+first. When a true graph merge is needed it gets a new ADR and a new
+operation. **Guard:** duplicates are only proposed on same canonical name
+AND same entity type.
+
+## ADR-014 · strict_edge_types via the bulk API is the pre-commit ontology gate
+**Status:** Accepted (2026-11-19). **Decision:** ingestion runs
+`add_episode_bulk(strict_edge_types=True)` (the only graphiti 0.31.2 API
+that exposes strict typing) so non-canonical extracted edges are dropped
+before commit; a post-write pass re-validates returned edges by relation
+name + endpoint labels and quarantines/compensates anything non-canonical.
+**Verified upstream behavior:** the FalkorDB driver writes all entity edges
+with physical type RELATES_TO and stores the canonical relation in the
+`name` property; all canonical reads filter on `e.name`. Raw Cypher must
+use `e.name`, never `type(e)`.
+
+## ADR-015 · Deterministic marker extraction supports the combined-extraction schema
+**Status:** Accepted (2026-11-19). **Decision:** the deterministic test LLM
+additionally handles `CombinedExtraction` (bulk path: entities + edges in
+one response). The `EXTRACTION:` marker protocol is unchanged; only the
+response shape dispatch grew.
+
+## ADR-016 · Deployment drill is an executable acceptance procedure
+**Status:** Accepted (2026-11-19). **Decision:** scripts/deploy_drill.py
+boots the production stack (real PostgreSQL via pgserver, persistent
+FalkorDB, Caddy TLS, uvicorn API + worker, production-mode auth) and
+executes the review's Gate 5 acceptance: HTTPS submit, idempotency,
+authz enforcement, second-client provenance retrieval, and a REAL
+backup+restore of both stores with consistency checks. **Result:** 27/27
+checks pass. The drill doubles as the VM deployment procedure.

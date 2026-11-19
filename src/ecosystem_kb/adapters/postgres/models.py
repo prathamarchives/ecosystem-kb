@@ -66,6 +66,8 @@ class KbEvent(Base):
     event_type: Mapped[str] = mapped_column(String(100), index=True)
     namespace: Mapped[str] = mapped_column(String(100), index=True)
     payload_reference: Mapped[str] = mapped_column(Text, default="")
+    event_payload: Mapped[str | None] = mapped_column(Text, nullable=True)
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     content_hash: Mapped[str | None] = mapped_column(String(100), nullable=True)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -83,6 +85,10 @@ class KbIngestionJob(Base):
         String(36), ForeignKey("kb_events.id"), index=True
     )
     status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     worker_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(
@@ -169,9 +175,62 @@ class KbClient(Base):
     token_hash: Mapped[str] = mapped_column(String(100))  # sha256, never the token
     scopes: Mapped[list] = mapped_column(JSON, default=list)
     allowed_namespaces: Mapped[list] = mapped_column(JSON, default=list)
+    allowed_sources: Mapped[list] = mapped_column(JSON, default=list)
     status: Mapped[str] = mapped_column(String(20), default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class KbMaintenanceAction(Base):
+    """Durable maintenance proposals with versioned, idempotent application
+    (review P1: proposals must survive restarts and process boundaries)."""
+
+    __tablename__ = "kb_maintenance_actions"
+
+    action_id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    operation: Mapped[str] = mapped_column(String(50))
+    namespace: Mapped[str] = mapped_column(String(100))
+    target: Mapped[str] = mapped_column(String(400))
+    candidates: Mapped[list] = mapped_column(JSON, default=list)
+    evidence: Mapped[list] = mapped_column(JSON, default=list)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    risk_level: Mapped[str] = mapped_column(String(20), default="medium")
+    reversibility: Mapped[str] = mapped_column(String(30), default="reversible")
+    proposal_version: Mapped[str] = mapped_column(String(64))
+    approval_status: Mapped[str] = mapped_column(String(20), default="pending")
+    reviewer: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_reason: Mapped[str] = mapped_column(Text, default="")
+    execution_status: Mapped[str] = mapped_column(String(30), default="not_started")
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    executed_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    apply_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class KbProvenanceLink(Base):
+    """The event/episode/source/entity/edge mapping that makes provenance
+    RETRIEVABLE, not merely recorded (review P1, LAW-002/015)."""
+
+    __tablename__ = "kb_provenance_links"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    namespace: Mapped[str] = mapped_column(String(100), index=True)
+    event_id: Mapped[str] = mapped_column(String(36), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(220))
+    episode_uuid: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    source_id: Mapped[str] = mapped_column(String(200))
+    source_uri: Mapped[str] = mapped_column(Text)
+    source_revision: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    entity_uuid: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    edge_uuid: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    fact: Mapped[str] = mapped_column(Text, default="")
+    ontology_version: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 ALL_TABLES = [
@@ -183,4 +242,6 @@ ALL_TABLES = [
     KbReviewQueue,
     KbAuditLog,
     KbClient,
+    KbMaintenanceAction,
+    KbProvenanceLink,
 ]

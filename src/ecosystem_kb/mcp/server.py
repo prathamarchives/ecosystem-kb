@@ -90,9 +90,6 @@ async def kb_submit_event(event_json: str) -> dict[str, Any]:
     services, _, client = await _aresolve(get_http_request())
     event = KnowledgeEvent(**json.loads(event_json))
     receipt = await services.submit_event(client, event)
-    row = await services.repos.events.get_by_event_id(str(event.event_id))
-    if row is not None and not receipt.duplicate:
-        await services.store_event_payload(row.id, event)
     return receipt.model_dump(mode="json")
 
 

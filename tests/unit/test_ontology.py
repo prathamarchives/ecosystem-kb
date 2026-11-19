@@ -99,7 +99,9 @@ class TestVariables:
         assert a != b
 
     def test_spec_validates_type_of_default(self):
-        with pytest.raises(Exception):
+        from pydantic import ValidationError as PydanticValidationError
+
+        with pytest.raises(PydanticValidationError):
             VariableDefinitionSpec(
                 name="api_timeout",
                 kind=VariableKind.CONFIGURATION,

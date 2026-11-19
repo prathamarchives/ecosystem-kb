@@ -54,12 +54,16 @@ class TestEventEnvelope:
         ],
     )
     def test_invalid_events_rejected(self, override):
-        with pytest.raises(Exception):
+        from pydantic import ValidationError as PydanticValidationError
+
+        with pytest.raises(PydanticValidationError):
             KnowledgeEvent(**_base_event(**override))
 
     def test_year_skew_rejected(self):
+        from pydantic import ValidationError as PydanticValidationError
+
         old = datetime.now(UTC) - timedelta(days=400)
-        with pytest.raises(Exception):
+        with pytest.raises(PydanticValidationError):
             KnowledgeEvent(
                 **_base_event(
                     timestamps={
@@ -120,7 +124,9 @@ class TestLifecycle:
         assert s == IngestionEventState.COMPLETED
 
     def test_illegal_jump_rejected(self):
-        with pytest.raises(Exception):
+        from ecosystem_kb.core.lifecycle import InvalidTransition
+
+        with pytest.raises(InvalidTransition):
             transition_ingestion(
                 IngestionEventState.RECEIVED, IngestionEventState.COMPLETED
             )
@@ -140,7 +146,9 @@ class TestLifecycle:
         assert s == ReviewState.DISPUTED
 
     def test_review_cannot_skip(self):
-        with pytest.raises(Exception):
+        from ecosystem_kb.core.lifecycle import InvalidTransition
+
+        with pytest.raises(InvalidTransition):
             transition_review(ReviewState.UNREVIEWED, ReviewState.APPROVED)
 
 

@@ -12,6 +12,9 @@ class KbSettings(BaseSettings):
         env_prefix="KB_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
 
+    # 'production' disables the static dev-token fallback (review P1).
+    environment: str = "development"
+
     # Control plane
     database_url: str = "sqlite+aiosqlite:///./data/kb_dev.db"
 
@@ -36,6 +39,22 @@ class KbSettings(BaseSettings):
     max_event_body_chars: int = 100_000
     worker_lease_seconds: int = 300
     worker_max_attempts: int = 5
+
+    @property
+    def is_production(self) -> bool:
+        return self.environment.lower() in ("production", "prod")
+
+    def validate_runtime_safety(self) -> None:
+        """Fail fast on unsafe production configurations (review P1)."""
+        if self.is_production:
+            weak = [t for t in self.token_list if len(t) < 32]
+            if weak:
+                raise RuntimeError(
+                    "refusing to start in production with static dev tokens; "
+                    "register real clients and remove KB_API_TOKENS"
+                )
+            if "local-dev-token-1" in self.token_list:
+                raise RuntimeError("known development token present in production config")
 
     @property
     def token_list(self) -> list[str]:

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -22,7 +22,7 @@ IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._:-]{2,200}$")
 CANONICAL_URI_PATTERN = re.compile(r"^[a-z][a-z0-9+.-]*://\S+$")
 
 
-class ActorType(str, Enum):
+class ActorType(StrEnum):
     HUMAN = "human"
     APPLICATION = "application"
     AGENT = "agent"
@@ -30,7 +30,7 @@ class ActorType(str, Enum):
     UNKNOWN = "unknown"
 
 
-class ContentType(str, Enum):
+class ContentType(StrEnum):
     TEXT = "text"
     MARKDOWN = "markdown"
     JSON = "json"
