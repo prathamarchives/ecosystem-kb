@@ -33,7 +33,15 @@ class KbSettings(BaseSettings):
     llm_provider: str = "fake"
     llm_model: str = "fake-extractor"
     llm_api_key: str | None = None
+    llm_base_url: str | None = None
     embedder_model: str = "fake-embedder"
+    embedding_dim: int = 1536
+    reranker: str = "fake"
+
+    # Optional Supabase Auth / OAuth 2.1 integration (MCP + UI login).
+    supabase_url: str | None = None
+    supabase_anon_key: str | None = None
+    public_base_url: str | None = None
 
     # Limits
     max_event_body_chars: int = 100_000

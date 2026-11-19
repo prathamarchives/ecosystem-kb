@@ -80,10 +80,207 @@ def create_app(
     from ecosystem_kb.api.routes.knowledge import router as knowledge_router
     from ecosystem_kb.api.routes.maintenance import router as maintenance_router
 
+    # Browser UI lives on a sibling subdomain; allow its origin to call the API.
+    if settings.supabase_url:
+        from fastapi.middleware.cors import CORSMiddleware
+
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["https://knowledgebase.itscatalyst.com"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
     app.include_router(events_router, prefix="/v1")
     app.include_router(knowledge_router, prefix="/v1")
     app.include_router(maintenance_router, prefix="/v1")
     app.include_router(admin_router, prefix="/v1")
+
+    # OAuth 2.1 discovery for MCP clients (RFC 9728 + RFC 8414). Supabase is
+    # the actual issuer; we publish a full AS metadata document here because
+    # Supabase's OIDC discovery omits `registration_endpoint`, which breaks
+    # clients using Dynamic Client Registration (e.g. ChatGPT connectors).
+    if settings.supabase_url:
+        from fastapi.responses import JSONResponse
+
+        _base = (settings.public_base_url or "").rstrip("/")
+        _supabase = settings.supabase_url.rstrip("/") + "/auth/v1"
+        _resource = _base + "/mcp"
+
+        def _protected_resource():
+            return {
+                "resource": _resource,
+                # Point at THIS host so clients fetch our complete AS metadata.
+                "authorization_servers": [_base],
+                "scopes_supported": ["openid", "email", "profile", "kb:read", "kb:write"],
+                "bearer_methods_supported": ["header"],
+            }
+
+        def _as_metadata():
+            return {
+                "issuer": _base,
+                "authorization_endpoint": _supabase + "/oauth/authorize",
+                "token_endpoint": _supabase + "/oauth/token",
+                "registration_endpoint": _supabase + "/oauth/clients/register",
+                "jwks_uri": _supabase + "/.well-known/jwks.json",
+                "scopes_supported": ["openid", "email", "profile", "phone", "offline_access", "kb:read", "kb:write"],
+                "response_types_supported": ["code"],
+                "grant_types_supported": ["authorization_code", "refresh_token"],
+                "code_challenge_methods_supported": ["S256"],
+                "token_endpoint_auth_methods_supported": [
+                    "client_secret_basic", "client_secret_post", "none"
+                ],
+            }
+
+        @app.get("/.well-known/oauth-protected-resource")
+        @app.get("/.well-known/oauth-protected-resource/mcp")
+        async def oauth_protected_resource():
+            return JSONResponse(_protected_resource())
+
+        @app.get("/.well-known/oauth-authorization-server")
+        @app.get("/.well-known/oauth-authorization-server/mcp")
+        async def oauth_authorization_server():
+            return JSONResponse(_as_metadata())
+
+    # A minimal, connector-friendly OpenAPI document (OpenAPI 3.0.3) for
+    # ChatGPT/agent connectors that reject the auto-generated 3.1 schema
+    # (no server URL, no security scheme, admin endpoints exposed).
+    @app.get("/connector/openapi.json", include_in_schema=False)
+    async def connector_openapi():
+        base = (settings.public_base_url or "").rstrip("/")
+        security = (
+            [{"openIdConnect": [settings.supabase_url.rstrip("/") + "/auth/v1"]}]
+            if settings.supabase_url
+            else [{"bearerAuth": []}]
+        )
+        schemes = {
+            "bearerAuth": {"type": "http", "scheme": "bearer"},
+        }
+        if settings.supabase_url:
+            schemes["openIdConnect"] = {
+                "type": "openIdConnect",
+                "openIdConnectUrl": settings.supabase_url.rstrip("/")
+                + "/auth/v1/.well-known/openid-configuration",
+            }
+        return {
+            "openapi": "3.0.3",
+            "info": {
+                "title": "ecosystem-kb",
+                "version": "1.0.0",
+                "description": "Shared source-of-truth knowledge graph: search and capture source-backed facts with provenance.",
+            },
+            "servers": [{"url": base}],
+            "security": security,
+            "paths": {
+                "/v1/search": {
+                    "post": {
+                        "operationId": "kb_search",
+                        "summary": "Search the knowledge graph",
+                        "description": "Retrieve source-backed facts about a topic, decision, or entity. Results include provenance and epistemic status.",
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/SearchRequest"}
+                                }
+                            },
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "Search results with facts and provenance",
+                                "content": {
+                                    "application/json": {"schema": {"type": "object"}}
+                                },
+                            },
+                            "401": {"description": "Not authenticated"},
+                        },
+                    }
+                },
+                "/v1/events": {
+                    "post": {
+                        "operationId": "kb_capture",
+                        "summary": "Capture durable knowledge",
+                        "description": "Store a decision, finding, or correction as a provenance-bearing knowledge event. Extraction of typed entities happens asynchronously.",
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/KnowledgeEvent"}
+                                }
+                            },
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "Event receipt",
+                                "content": {
+                                    "application/json": {"schema": {"type": "object"}}
+                                },
+                            },
+                            "401": {"description": "Not authenticated"},
+                        },
+                    }
+                },
+            },
+            "components": {
+                "securitySchemes": schemes,
+                "schemas": {
+                    "SearchRequest": {
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Natural-language search query",
+                            },
+                            "num_results": {"type": "integer", "default": 10},
+                        },
+                    },
+                    "KnowledgeEvent": {
+                        "type": "object",
+                        "required": [
+                            "idempotency_key",
+                            "event_type",
+                            "source",
+                            "timestamps",
+                            "content",
+                        ],
+                        "properties": {
+                            "idempotency_key": {
+                                "type": "string",
+                                "description": "Caller-scoped unique key, e.g. chatgpt:message-123",
+                            },
+                            "event_type": {
+                                "type": "string",
+                                "description": "Namespaced type, e.g. knowledge.decision.recorded",
+                            },
+                            "source": {
+                                "type": "object",
+                                "properties": {
+                                    "system_id": {"type": "string"},
+                                    "record_id": {"type": "string"},
+                                    "canonical_uri": {"type": "string"},
+                                },
+                            },
+                            "timestamps": {
+                                "type": "object",
+                                "properties": {
+                                    "occurred_at": {"type": "string", "format": "date-time"},
+                                    "recorded_at": {"type": "string", "format": "date-time"},
+                                },
+                            },
+                            "content": {
+                                "type": "object",
+                                "properties": {
+                                    "content_type": {"type": "string", "default": "text"},
+                                    "body": {"type": "string"},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        }
 
     @app.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
@@ -161,8 +358,15 @@ def create_app(
                         error = (401, "invalid_token", "invalid or revoked token")
             if error is not None:
                 status, code, message = error
+                headers = {}
+                if settings.supabase_url and settings.public_base_url:
+                    base = settings.public_base_url.rstrip("/")
+                    headers["WWW-Authenticate"] = (
+                        f'Bearer resource_metadata="{base}/.well-known/'
+                        'oauth-protected-resource"'
+                    )
                 response = JSONResponse(
-                    {"error": code, "message": message}, status_code=status
+                    {"error": code, "message": message}, status_code=status, headers=headers
                 )
                 await response(scope, receive, send)
                 return

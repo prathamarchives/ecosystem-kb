@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ecosystem-kb</title>
+<style>
+  :root { color-scheme: dark; --bg:#0e1117; --card:#161b24; --line:#2a3140; --fg:#e6e9ef; --muted:#9aa4b5; --accent:#5eead4; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  header { display:flex; align-items:center; justify-content:space-between; padding:16px 24px; border-bottom:1px solid var(--line); }
+  header h1 { margin:0; font-size:18px; letter-spacing:.3px; }
+  header h1 span { color:var(--accent); }
+  main { max-width:860px; margin:28px auto; padding:0 20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; margin-bottom:18px; }
+  h2 { margin:0 0 12px; font-size:16px; }
+  label { display:block; color:var(--muted); font-size:13px; margin:12px 0 5px; }
+  input, textarea { width:100%; background:#0c1016; border:1px solid var(--line); color:var(--fg); border-radius:8px; padding:10px 12px; font:inherit; }
+  textarea { min-height:110px; resize:vertical; }
+  button { background:var(--accent); color:#062521; border:0; border-radius:8px; padding:9px 16px; font-weight:600; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--fg); border:1px solid var(--line); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .row { display:flex; gap:10px; align-items:center; }
+  .muted { color:var(--muted); font-size:13px; }
+  .fact { border-left:2px solid var(--accent); padding:8px 12px; margin:8px 0; background:#0c1016; border-radius:0 8px 8px 0; }
+  .fact .meta { color:var(--muted); font-size:12px; margin-top:4px; }
+  .tabs { display:flex; gap:8px; margin-bottom:14px; }
+  .tabs button { background:transparent; color:var(--muted); border:1px solid var(--line); }
+  .tabs button.active { color:var(--accent); border-color:var(--accent); }
+  .hide { display:none; }
+  #msg { min-height:20px; color:var(--accent); margin-top:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ecosystem<span>-kb</span></h1>
+  <div id="authbar" class="row"></div>
+</header>
+<main>
+  <div id="consent" class="card hide">
+    <h2>Authorization request</h2>
+    <div id="consent-details" class="muted">Loading…</div>
+    <div class="row" style="margin-top:14px">
+      <button id="approve">Approve</button>
+      <button id="deny" class="ghost">Deny</button>
+    </div>
+  </div>
+
+  <div id="app" class="hide">
+    <div class="tabs">
+      <button id="tab-search" class="active">Search</button>
+      <button id="tab-capture">Capture</button>
+    </div>
+
+    <section id="pane-search">
+      <div class="card">
+        <h2>Search the knowledge graph</h2>
+        <label>Query</label>
+        <input id="q" placeholder="What do we know about FalkorDB?" />
+        <div class="row" style="margin-top:12px"><button id="do-search">Search</button></div>
+        <div id="msg"></div>
+      </div>
+      <div id="results"></div>
+    </section>
+
+    <section id="pane-capture" class="hide">
+      <div class="card">
+        <h2>Capture knowledge</h2>
+        <label>Title</label>
+        <input id="c-title" placeholder="Decision: use named Cloudflare tunnel" />
+        <label>Content</label>
+        <textarea id="c-body" placeholder="What happened, what was decided, and why…"></textarea>
+        <label>Agent-authored extraction JSON (optional, for the current client-LLM mode)</label>
+        <textarea id="c-extract" placeholder='{"entities":[...],"edges":[...]}'></textarea>
+        <div class="row" style="margin-top:12px"><button id="do-capture">Capture</button></div>
+        <div id="capture-msg" class="muted"></div>
+      </div>
+    </section>
+  </div>
+
+  <div id="login" class="card hide">
+    <h2>Sign in</h2>
+    <p class="muted">Use a magic link. Your session is used for both this UI and MCP authorization.</p>
+    <label>Email</label>
+    <input id="email" type="email" placeholder="you@example.com" />
+    <div class="row" style="margin-top:12px"><button id="do-login">Send magic link</button></div>
+  </div>
+</main>
+
+<script type="module">
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+const cfg = await (await fetch('/config.js')).json();
+const supabase = createClient(cfg.url, cfg.anon);
+const API = 'https://kb.itscatalyst.com/v1';
+const $ = id => document.getElementById(id);
+
+function show(id){ ['login','app','consent'].forEach(x => $(x).classList.toggle('hide', x!==id)); }
+const params = new URLSearchParams(location.search);
+
+async function renderAuth(){
+  const { data:{ session } } = await supabase.auth.getSession();
+  if (session) {
+    $('authbar').innerHTML = `<span class="muted">${session.user.email||session.user.id}</span> <button id="logout" class="ghost">Sign out</button>`;
+    $('logout').onclick = async () => { await supabase.auth.signOut(); location.reload(); };
+    if (params.has('authorization_id')) await renderConsent(); else show('app');
+  } else { $('authbar').innerHTML=''; show('login'); }
+}
+
+async function renderConsent(){
+  show('consent');
+  const id = params.get('authorization_id');
+  try {
+    const { data, error } = await supabase.auth.oauth.getAuthorizationDetails(id);
+    if (error) throw error;
+    const d = data || {};
+    const req = d.authorization_request || d;
+    const client = req.client_name || req.client?.client_name || req.client_id || d.client_id || 'an AI client';
+    const scope = req.scope || d.scope || '';
+    $('consent-details').innerHTML = `<strong>${client}</strong> is requesting access.<br>Scopes: ${scope || '(none shown)'}`
+      + `<details class="muted"><summary>details</summary><pre>${JSON.stringify(d, null, 2)}</pre></details>`;
+    $('approve').onclick = async () => { const {error}=await supabase.auth.oauth.approveAuthorization(id); if(error) alert(error.message); else location.href='/'; };
+    $('deny').onclick = async () => { await supabase.auth.oauth.denyAuthorization(id); location.href='/'; };
+  } catch(e){ $('consent-details').textContent = 'Could not load authorization details: '+e.message; }
+}
+
+async function token(){ const { data:{session} } = await supabase.auth.getSession(); return session?.access_token; }
+async function api(path, body){
+  const t = await token();
+  const r = await fetch(API+path, { method: body?'POST':'GET', headers:{ 'Authorization':'Bearer '+t, 'Content-Type':'application/json' }, body: body?JSON.stringify(body):undefined });
+  const j = await r.json().catch(()=>({error:r.statusText}));
+  if(!r.ok) throw new Error(j.message||j.error||('HTTP '+r.status));
+  return j;
+}
+
+$('do-login').onclick = async () => {
+  const { error } = await supabase.auth.signInWithOtp({ email: $('email').value, options:{ emailRedirectTo: location.origin+'/' } });
+  $('login').insertAdjacentHTML('beforeend', `<p class="muted">${error?error.message:'Check your inbox for the magic link.'}</p>`);
+};
+$('do-search').onclick = async () => {
+  $('msg').textContent='Searching…'; $('results').innerHTML='';
+  try {
+    const r = await api('/search', { query: $('q').value, num_results: 10 });
+    const facts = r.facts||[];
+    $('msg').textContent = facts.length+' result(s)';
+    $('results').innerHTML = facts.map(f=>`<div class="fact"><div>${f.fact}</div><div class="meta">${f.relation||''} · ${f.provenance||''}</div></div>`).join('');
+  } catch(e){ $('msg').textContent='Error: '+e.message; }
+};
+$('do-capture').onclick = async () => {
+  const title=$('c-title').value.trim(), body=$('c-body').value.trim();
+  if(!title||!body) { $('capture-msg').textContent='Title and content required.'; return; }
+  const now=new Date().toISOString(), key='ui:'+crypto.randomUUID();
+  let content=body;
+  const ex=$('c-extract').value.trim();
+  if(ex) content += '\nEXTRACTION: '+ex;
+  const event={
+    idempotency_key:key, event_type:'knowledge.decision.recorded',
+    source:{system_id:'system:web-ui', record_id:key, canonical_uri:'webui://capture/'+key},
+    timestamps:{occurred_at:now, recorded_at:now},
+    content:{content_type:'text', body:`${title}\n${content}`}
+  };
+  try { const r=await api('/events', event); $('capture-msg').textContent='Queued: '+r.event_id; }
+  catch(e){ $('capture-msg').textContent='Error: '+e.message; }
+};
+$('tab-search').onclick=()=>{ $('tab-search').classList.add('active'); $('tab-capture').classList.remove('active'); $('pane-search').classList.remove('hide'); $('pane-capture').classList.add('hide'); };
+$('tab-capture').onclick=()=>{ $('tab-capture').classList.add('active'); $('tab-search').classList.remove('active'); $('pane-capture').classList.remove('hide'); $('pane-search').classList.add('hide'); };
+renderAuth();
+</script>
+</body>
+</html>

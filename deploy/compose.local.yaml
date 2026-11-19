@@ -50,11 +50,14 @@ services:
     # Private: no ports published (plan §4.2).
 
   falkordb:
-    image: falkordb/falkordb:4.22.1
+    image: falkordb/falkordb:v4.22.1
     environment:
       FALKORDB_PASSWORD: ${FALKORDB_PASSWORD}
+      # The image's run.sh ignores FALKORDB_PASSWORD; Redis auth needs REDIS_ARGS.
+      REDIS_ARGS: --requirepass ${FALKORDB_PASSWORD}
     volumes:
-      - falkordb_data:/data
+      # run.sh uses FALKORDB_DATA_PATH=/var/lib/falkordb/data, not /data.
+      - falkordb_data:/var/lib/falkordb/data
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -a $$FALKORDB_PASSWORD --no-auth-warning ping | grep -q PONG"]
       interval: 5s
@@ -118,8 +121,18 @@ services:
         condition: service_healthy
     restart: unless-stopped
     networks: [kb-internal]
-    # Routes to http://api:8000 — configured in the Cloudflare dashboard
-    # (plan §C2). No published ports: the connection is outbound-only.
+    # Routes to http://api:8000 and http://ui:3000 — configured in the
+    # Cloudflare tunnel. No published ports: outbound-only.
+
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    environment:
+      SUPABASE_URL: ${KB_SUPABASE_URL}
+      SUPABASE_ANON_KEY: ${KB_SUPABASE_ANON_KEY}
+    restart: unless-stopped
+    networks: [kb-internal]
 
 volumes:
   postgres_data:

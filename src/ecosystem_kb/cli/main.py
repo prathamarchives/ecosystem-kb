@@ -505,7 +505,10 @@ async def _cmd_connect(args) -> None:
     env = _load_env()
     name = args.name or _default_client_name(args.target)
     public = env.get("KB_PUBLIC_URL")
-    endpoint = f"{public}/mcp" if public else f"{_api_base()}/mcp"
+    # FastMCP's Streamable HTTP route needs the trailing slash; without it a
+    # TLS-terminating proxy (Cloudflare) turns the redirect into an http://
+    # downgrade that clients refuse.
+    endpoint = f"{public.rstrip('/')}/mcp/" if public else f"{_api_base()}/mcp/"
 
     existing = None
     try:
@@ -661,7 +664,7 @@ def _cmd_backup(args) -> None:
         sys.exit(f"FalkorDB SAVE FAILED — no backup written. {r.stdout[:200]} {r.stderr[:200]}")
     rdb_tmp = tmp / "falkordb.rdb"
     rc = subprocess.run(
-        ["docker", "compose", "-f", str(COMPOSE_LOCAL), "cp", "falkordb:/data/dump.rdb", str(rdb_tmp)],
+        ["docker", "compose", "-f", str(COMPOSE_LOCAL), "cp", "falkordb:/var/lib/falkordb/data/dump.rdb", str(rdb_tmp)],
         cwd=DEPLOY_ROOT, capture_output=True,
     )
     if rc.returncode != 0 or not rdb_tmp.exists() or rdb_tmp.stat().st_size == 0:
@@ -692,7 +695,8 @@ def _cmd_backup(args) -> None:
 
     # 4. Verify checksums, then atomically publish (plan §B5).
     for name, p in artifacts.items():
-        assert sha256(p) == manifest["components"][name.split(".")[0]]["sha256"], f"checksum mismatch for {name}"
+        key = "postgres" if name.startswith("control_plane") else "falkordb"
+        assert sha256(p) == manifest["components"][key]["sha256"], f"checksum mismatch for {name}"
     if out_dir.exists():
         shutil.rmtree(out_dir)
     tmp.rename(out_dir)
@@ -745,7 +749,7 @@ def _cmd_restore(args) -> None:
     subprocess.run(["docker", "volume", "rm", "ecosystem-kb_falkordb_data"], cwd=DEPLOY_ROOT, check=True)
     _compose("up", "-d", "--wait", "falkordb")
     subprocess.run(
-        ["docker", "compose", "-f", str(COMPOSE_LOCAL), "cp", str(src / "falkordb.rdb"), "falkordb:/data/dump.rdb"],
+        ["docker", "compose", "-f", str(COMPOSE_LOCAL), "cp", str(src / "falkordb.rdb"), "falkordb:/var/lib/falkordb/data/dump.rdb"],
         cwd=DEPLOY_ROOT, check=True,
     )
     _compose("restart", "falkordb")
@@ -856,7 +860,8 @@ def main(argv: list[str] | None = None) -> None:
     p_doc.add_argument("--verbose", action="store_true")
     p_doc.add_argument("--strict", action="store_true",
                        help="treat optional-provisioning warnings (tunnel, backup, LLM) as failures")
-    sub.add_parser("backup", help="Verified backup of postgres + falkordb")
+    p_bak = sub.add_parser("backup", help="Verified backup of postgres + falkordb")
+    p_bak.add_argument("--output", help="backup output directory")
     p_res = sub.add_parser("restore", help="Restore a backup (checksums verified first)")
     p_res.add_argument("path")
     p_res.add_argument("--yes", action="store_true", help="confirm overwrite of live volumes")

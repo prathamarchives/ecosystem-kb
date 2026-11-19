@@ -23,6 +23,39 @@ class AuthService:
     def __init__(self, repos: Repositories, settings: KbSettings) -> None:
         self.repos = repos
         self.settings = settings
+        self._supabase = None
+        if settings.supabase_url:
+            from ecosystem_kb.api.supabase_auth import SupabaseJWTVerifier
+
+            self._supabase = SupabaseJWTVerifier(
+                settings.supabase_url, settings.supabase_anon_key
+            )
+
+    async def _supabase_client(self, token: str) -> AuthenticatedClient | None:
+        """Verify a Supabase-issued JWT and map its claims to a KB client."""
+        if self._supabase is None:
+            return None
+        try:
+            claims = await self._supabase.verify(token)
+        except Exception:
+            return None
+        sub = claims.get("sub") or claims.get("user_id")
+        if not sub:
+            return None
+        meta = claims.get("app_metadata") or {}
+        scopes = meta.get("kb_scopes") or ["kb:read", "kb:write"]
+        namespaces = meta.get("kb_namespaces") or self.settings.namespace_list
+        if isinstance(namespaces, str):
+            namespaces = [namespaces]
+        return AuthenticatedClient(
+            client_id=f"supabase:{sub}",
+            scopes=list(scopes),
+            allowed_namespaces=list(namespaces),
+            allowed_sources=["*"],
+            default_namespace=self.settings.default_namespace
+            if self.settings.default_namespace in namespaces
+            else None,
+        )
 
     async def authenticate_token(self, token: str) -> AuthenticatedClient:
         """Token -> client (used by the MCP mount, which reads the header itself)."""
@@ -30,6 +63,9 @@ class AuthService:
             raise AuthenticationError("missing bearer token")
         row = await self.repos.clients.find_by_token(token)
         if row is None:
+            oauth_client = await self._supabase_client(token)
+            if oauth_client is not None:
+                return oauth_client
             # Static fallback tokens are a DEVELOPMENT convenience only.
             if self.settings.is_production:
                 raise AuthenticationError("invalid token")
@@ -60,6 +96,9 @@ class AuthService:
             raise AuthenticationError("missing bearer token")
         row = await self.repos.clients.find_by_token(credentials.credentials)
         if row is None:
+            oauth_client = await self._supabase_client(credentials.credentials)
+            if oauth_client is not None:
+                return oauth_client
             # Dev-mode fallback: tokens from settings act as admin clients.
             if credentials.credentials in self.settings.token_list:
                 return AuthenticatedClient(

@@ -35,6 +35,7 @@ def build_llm_client(settings: KbSettings) -> LLMClient:
                 api_key=settings.llm_api_key,
                 model=settings.llm_model,
                 small_model=settings.llm_model,
+                base_url=settings.llm_base_url,
             )
         )
     raise ValueError(f"unsupported llm provider: {settings.llm_provider}")
@@ -42,19 +43,33 @@ def build_llm_client(settings: KbSettings) -> LLMClient:
 
 def build_embedder(settings: KbSettings) -> EmbedderClient:
     if settings.llm_provider == "fake":
-        return DeterministicEmbedder()
-    from graphiti_core.embedder.client import EmbedderConfig
-    from graphiti_core.embedder.openai import OpenAIEmbedder
+        return DeterministicEmbedder(dim=settings.embedding_dim)
+    from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 
-    return OpenAIEmbedder(config=EmbedderConfig(embedding_dim=1536))
+    return OpenAIEmbedder(
+        config=OpenAIEmbedderConfig(
+            embedding_dim=settings.embedding_dim,
+            embedding_model=settings.embedder_model,
+            api_key=settings.llm_api_key,
+            base_url=settings.llm_base_url,
+        )
+    )
 
 
 def build_cross_encoder(settings: KbSettings) -> CrossEncoderClient:
-    if settings.llm_provider == "fake":
+    if settings.llm_provider == "fake" or settings.reranker == "fake":
         return DeterministicReranker()
     from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
+    from graphiti_core.llm_client.config import LLMConfig
 
-    return OpenAIRerankerClient()
+    return OpenAIRerankerClient(
+        config=LLMConfig(
+            api_key=settings.llm_api_key,
+            model=settings.llm_model,
+            small_model=settings.llm_model,
+            base_url=settings.llm_base_url,
+        )
+    )
 
 
 def build_graphiti(
