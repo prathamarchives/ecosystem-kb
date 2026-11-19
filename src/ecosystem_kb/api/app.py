@@ -75,6 +75,7 @@ def create_app(
 
     app = FastAPI(title="ecosystem-kb", version="0.1.0", lifespan=lifespan)
 
+    from ecosystem_kb.api.routes.admin import router as admin_router
     from ecosystem_kb.api.routes.events import router as events_router
     from ecosystem_kb.api.routes.knowledge import router as knowledge_router
     from ecosystem_kb.api.routes.maintenance import router as maintenance_router
@@ -82,6 +83,7 @@ def create_app(
     app.include_router(events_router, prefix="/v1")
     app.include_router(knowledge_router, prefix="/v1")
     app.include_router(maintenance_router, prefix="/v1")
+    app.include_router(admin_router, prefix="/v1")
 
     @app.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:

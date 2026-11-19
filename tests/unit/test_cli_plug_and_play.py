@@ -47,7 +47,8 @@ class TestSetup:
         assert len(pg.split("=", 1)[1]) >= 24 and len(fk.split("=", 1)[1]) >= 24
         out = capsys.readouterr().out
         assert "KB_LLM_API_KEY is empty" in out  # read-only warning
-        assert "Store it in a password manager" in out  # admin token shown once note
+        assert "READ-ONLY" in out  # repair §4: clear mode statement
+        assert "store the values in a password manager" in out
         # Admin token itself must be in the file but never printed.
         admin = [ln for ln in text.splitlines() if ln.startswith("KB_ADMIN_TOKEN=")][0]
         assert admin.split("=", 1)[1] not in out

@@ -577,6 +577,39 @@ class ClientRepository:
                 select(KbClient).where(KbClient.token_hash == hash_token(token))
             )
 
+    async def get(self, client_id: str) -> KbClient | None:
+        async with self.cp.session() as s:
+            return await s.scalar(select(KbClient).where(KbClient.client_id == client_id))
+
+    async def ensure_admin_client(
+        self, client_id: str = "kb-admin", token: str | None = None
+    ) -> str:
+        """Idempotently ensure an administrator client exists.
+
+        Used by `kb bootstrap --seed-admin` so the host CLI has a credential
+        for the admin API without any direct database access. If the client
+        already exists, nothing changes and "" is returned — the stored
+        token hash is the authority and the CLI keeps its copy in the
+        untracked .env.
+        """
+        token = token or secrets.token_urlsafe(32)
+        async with self.cp.session() as s:
+            row = await s.scalar(select(KbClient).where(KbClient.client_id == client_id))
+            if row is not None:
+                return ""
+            s.add(
+                KbClient(
+                    client_id=client_id,
+                    client_name="Host CLI administrator",
+                    token_hash=hash_token(token),
+                    scopes=["kb:read", "kb:write", "kb:review", "kb:maintain", "kb:admin"],
+                    allowed_namespaces=["*"],
+                    allowed_sources=["*"],
+                )
+            )
+            await s.commit()
+        return token
+
     async def list_clients(self) -> list[KbClient]:
         """All registered clients (plug-and-play: kb client list)."""
         async with self.cp.session() as s:

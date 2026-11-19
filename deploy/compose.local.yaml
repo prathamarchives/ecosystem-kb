@@ -1,10 +1,12 @@
-# Ecosystem KB — LOCAL plug-and-play profile (ADR-017).
+# Ecosystem KB — LOCAL plug-and-play profile (ADR-017, ADR-019).
 #
 # One managed stack on the owner's machine: PostgreSQL + FalkorDB + API +
 # worker (+ optional cloudflared named tunnel). Databases are PRIVATE (no
-# published ports); the only ingress is the named Cloudflare Tunnel hitting
-# http://api:8000 over this network. The VM profile with its own TLS edge
-# stays in deploy/compose.yaml — the two never stack.
+# published ports). The API publishes ONLY to the host loopback interface
+# (127.0.0.1:${KB_BIND_PORT:-8000}) so the host CLI and MCP Inspector can
+# reach it while nothing is exposed to the LAN. The Cloudflare Tunnel hits
+# http://api:8000 over the internal network. The VM profile with its own
+# TLS edge stays in deploy/compose.yaml — the two never stack.
 #
 # Usage (from repo root, after `kb setup`):
 #   docker compose -f deploy/compose.local.yaml --profile tunnel up -d
@@ -64,7 +66,7 @@ services:
 
   migrate:
     <<: *kb-app
-    command: kb bootstrap --migrate-only
+    command: kb bootstrap --seed-admin
     depends_on:
       postgres:
         condition: service_healthy
@@ -75,6 +77,10 @@ services:
   api:
     <<: *kb-app
     command: uvicorn ecosystem_kb.api.app:create_app --factory --host 0.0.0.0 --port 8000
+    ports:
+      # Loopback ONLY (repair §2): the host CLI / MCP Inspector reach the API
+      # at 127.0.0.1:${KB_BIND_PORT}; the LAN and other machines cannot.
+      - "127.0.0.1:${KB_BIND_PORT:-8000}:8000"
     depends_on:
       postgres:
         condition: service_healthy
