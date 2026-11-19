@@ -132,7 +132,7 @@ class TestBackupManifest:
         }
         (src / "manifest.json").write_text(json.dumps(manifest))
         # Untampered: every checksum matches (this is the check _cmd_restore runs).
-        for comp, meta in manifest["components"].items():
+        for _comp, meta in manifest["components"].items():
             digest = "sha256:" + hashlib.sha256((src / meta["file"]).read_bytes()).hexdigest()
             assert digest == meta["sha256"]
         # Tampered: the same check must diverge.
