@@ -1,63 +1,115 @@
 # STATE.md — current implementation state
 
-Last updated: 2026-11-19 (repair/onboarding-host-cli, on top of main@ff32c93)
+Last updated: 2026-11-19 (feat/supermemory-style-mcp-oauth, on top of main@5356824)
 
 ## Baseline
 
-`main@ff32c93` is the merged plug-and-play milestone (PR #1; CI runs
-44480930330 on the PR and 44481173378 on main, both green, 5/5 jobs:
-lint, unit, embedded-integration, postgres-integration, docker-build).
-In-sandbox verification at merge time: **141 passed / 2 skipped**, ruff
-clean, deployment drill 27/27.
+main@5356824 carried the host-side Supabase OAuth proxy work; CI was RED
+on main (trailing-slash regression: tests/integration/test_host_cli.py
+:190/:205 expected `.../mcp`, the CLI and app emitted/served `/mcp/`).
+Baseline in this sandbox at branch start: 155 passed / 2 failed / 2
+skipped, ruff clean.
 
-## This branch: final onboarding repair
+## This branch: supermemory-style MCP plug-and-play
 
-Problems fixed (all owner-facing, found by re-testing the milestone the
-way a real installation runs it):
+Runbook: upload/ECOSYSTEM_KB_SUPERMEMORY_STYLE_EXECUTION_RUNBOOK (1049
+lines). Branch commit 8ff3640. In-sandbox verification: **202 passed /
+0 failed / 2 skipped**, ruff clean, plus a 40-check end-to-end OAuth
+protocol smoke (scripts/oauth_smoke.py) with the app lifespan running.
 
-1. **Dead control-plane path (§1).** The CLI's client-management/status/
-   doctor commands connected directly to `127.0.0.1:5432` — invalid with
-   PostgreSQL on a private Compose network. Replaced with the loopback
-   admin API (`/v1/admin/*`, kb:admin scope, audited, REST-only, never
-   MCP tools) + `kb-admin` client seeded by the compose migrate one-shot
-   from `KB_ADMIN_TOKEN` (ADR-019; docs/HOST-CLI-ARCHITECTURE.md).
-2. **API reachability (§2).** Compose now publishes
-   `127.0.0.1:${KB_BIND_PORT:-8000}:8000` (loopback only); the CLI reads
-   `KB_BIND_HOST/PORT` everywhere; DB ports remain unpublished.
-3. **Connect wizard (§3).** Client id defaults from the target; re-running
-   connect on an active client REFUSES to rotate without `--rotate`;
-   Cursor output is real valid JSON (parsed before display) with actual
-   endpoint/token; `--write/--path` merges into mcp.json preserving
-   unrelated servers; credentials printed exactly once.
-4. **Doctor severity split (§4).** Mandatory failures (API readiness, MCP
-   initialize, admin API, .env perms) vs WARN for local-only tunnel,
-   no-backup-yet, LLM=read-only; `--strict` escalates warnings.
-   A clean local-only install exits 0.
-5. **Install-path bug (found by host-level tests).** Deployment state
-   (.env, backups, compose reference) was derived from the installed
-   package location — `kb setup` from any other directory wrote config
-   into the source tree. Now anchored to the working directory; real
-   environment variables override .env values.
+### What is implemented (runbook Steps 5-10, 12)
 
-## Test state (branch, final run)
+1. **Canonical config contract (Step 5).** KB_PUBLIC_BASE_URL (origin
+   only), KB_MCP_RESOURCE (derived <base>/mcp), KB_OWNER_SUPABASE_SUBJECT,
+   KB_ALLOW_STATIC_TOKENS / KB_ALLOW_LEGACY_CLIENT_TOKENS (default false),
+   production startup validation (HTTPS, resource binding, static-token
+   refusal). KB_PUBLIC_URL is a one-release alias with a deprecation log.
+2. **First-party OAuth 2.1 AS (Steps 5, 7).** Authorization Code + PKCE
+   S256 only; public clients (token_endpoint_auth_method=none); exact
+   redirect-URI matching; resource binding checked at authorize, token,
+   refresh and every /mcp request; opaque tokens stored SHA-256-hashed
+   (access 1h, refresh 30d, rotating); refresh replay revokes the family;
+   RFC 7009 revocation; DCR endpoint + CIMD resolution with an
+   SSRF-hardened HTTPS fetcher (private/loopback/multicast refused, no
+   redirects, size cap, JSON schema validation); RFC 9728 protected-
+   resource + RFC 8414 AS metadata, all same-origin, issuer = the public
+   origin; consent screen with stored-consent skip; pending
+   authorizations survive the email-link login round trip.
+   The Supabase `/oauth/*` proxy is REMOVED — Ecosystem KB is the issuer.
+3. **Owner login (Step 6).** Supabase magic link (PKCE,
+   shouldCreateUser=false) verified server-side (JWKS + pinned algs +
+   issuer + audience + exp + owner sub + authoritative admin user check
+   when the secret key is configured) exchanged for a first-party
+   kb_session cookie (HttpOnly, Secure, SameSite=Lax, 7-day, hashed at
+   rest, independently revocable). Routes: /auth/config, /auth/session,
+   /auth/me, /auth/logout, /auth/callback.
+   Supabase user JWTs are NO LONGER accepted as MCP/REST bearer tokens.
+4. **One principal resolver (Step 8).** AuthService.authenticate_token:
+   KB OAuth first (a formerly-valid-but-revoked OAuth token never falls
+   through to weaker paths), the loopback kb-admin client row always
+   valid (host CLI), static client tokens only under the migration flags.
+   The MCP ASGI gate calls the SAME resolver — MCP and REST accept
+   identical credentials; cookies never work on /mcp.
+5. **One-origin dashboard (Step 9).** FastAPI serves the whole owner UI
+   at /: Knowledge (search + capture with typed extraction JSON),
+   Clients (registration mode, consent, active tokens, revoke), Connect
+   (canonical URL + JSON snippet, no token field), Status (control plane,
+   graph, queue). CSP + security headers; untrusted values rendered with
+   textContent only; owner-session data endpoints with Origin checking.
+   The legacy ui container is behind the `legacy-ui` compose profile
+   pending owner-confirmed cutover.
+6. **Typed capture (Step 10).** kb_capture accepts an optional extraction
+   object (entities/edges against the controlled ontology); validated at
+   submit AND by the worker; invalid extraction rejected with specific
+   ontology errors; missing extraction under the fake provider reports
+   `capture saved; extraction unavailable`. The runbook's `EXTRACTION:`
+   marker parser does NOT exist in the repo (verified) — nothing to
+   deprecate; typed capture is the only path.
+7. **Canonical /mcp (the CI-red root cause).** FastAPI Mount +
+   redirect_slashes rewrote bare /mcp to /mcp/ before any mounted app
+   ran (verified: the middleware never saw the request). The MCP sub-app
+   is now owned by raw ASGI routes (/mcp + /mcp/ alias) that reproduce
+   the Mount root_path semantics without redirecting. kb connect and
+   kb doctor emit/probe the no-slash URL.
+8. **Tests (Step 12).** tests/contract/test_oauth_as.py (28 checks:
+   metadata, DCR negatives, authorize/consent/resume, PKCE negatives,
+   code reuse, rotation + replay + family revocation, cross-client
+   isolation, cross-origin refusal, session lifecycle) and
+   tests/contract/test_extraction.py (17 checks: ontology validation
+   matrix, honest statuses, integration through the service layer).
+   Migration count tests updated for 003.
 
-- unit 60, contract 21 (15 protocol + 6 admin-API over real HTTP),
-  security 12, integration 44 (32 + 9 host-subprocess + 3 extraction eval)
-  → **137 passed / 2 skipped**; ruff clean; drill 27/27.
-- CI now runs host CLI flows + the 30-case extraction eval (fake provider;
-  real-provider runbook in docs/EVAL.md). Docker-level §6 checks run on
-  the owner host via scripts/host_acceptance.sh (restart persistence, DB
-  port privacy, loopback-only bind, tunnel route).
+### Database
 
-## Honestly not done / limits
+Migration 003 (additive only): kb_sessions, oauth_clients,
+oauth_pending_authorizations, oauth_authorization_codes, oauth_tokens,
+oauth_consents, oauth_registration_tickets. Postgres + SQLite dialects;
+ORM parity asserted by the existing postgres-integration job.
 
-1. Container-level §6 items (real `kb up`, restart persistence, port
-   scans) execute on the owner's machine — no Docker daemon in the
-   sandbox. scripts/host_acceptance.sh automates them.
-2. Live named-tunnel check (§6.11) needs the owner's CF_TUNNEL_TOKEN.
-3. Real-LLM extraction quality still unmeasured (docs/EVAL.md runbook).
+### Owner actions still required (cannot be done from this sandbox)
 
-## Next actions
+1. Supabase hosted Auth settings: Site URL `https://kb.itscatalyst.com`,
+   redirect `https://kb.itscatalyst.com/auth/callback`, email provider
+   on, sign-ups disabled. The sb_secret key authenticates the Auth-admin
+   API (users) but NOT the Management API (needs an sbp_ access token);
+   applying these is a 2-minute dashboard task.
+2. Fill .env on the host: KB_PUBLIC_BASE_URL, KB_SUPABASE_URL,
+   KB_SUPABASE_ANON_KEY, KB_OWNER_SUPABASE_SUBJECT
+   (=ad0fa277-f001-433f-883d-87e4dab606a3), keep CF_TUNNEL_TOKEN.
+3. Deploy: git pull; docker compose build api worker; up -d (no -v);
+   verify /health /ready dashboard /mcp 401 metadata.
+4. Reconnect one real OAuth-capable client through the URL flow
+   (full browser flow per runbook Step 13), then the rest; then remove
+   KB_ALLOW_LEGACY_CLIENT_TOKENS if it was enabled.
+5. After public verification: remove the knowledgebase.itscatalyst.com
+   tunnel route + DNS record and the legacy-ui profile container.
 
-1. Merge this repair PR after CI green.
-2. Owner: `bash scripts/host_acceptance.sh` on the real machine.
+### Known limitations
+
+- Real-client browser-flow test (runbook Step 13) not yet executed —
+  needs the deployed host + a real MCP client; the 40-check smoke covers
+  the full protocol server-side.
+- Supabase hosted settings are owner actions (above).
+- The dashboard callback page redirects to / and relies on the login
+  card's Supabase JS flow; a pinned @supabase/supabase-js dependency
+  should replace any CDN include before cutover (runbook Step 6 note).
